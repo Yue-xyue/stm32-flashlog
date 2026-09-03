@@ -11,11 +11,16 @@
 #include "log_uart.h"
 #include <string.h>
 #include "crc32.h"
+#include "perf.h"
 
 static uint32_t s_write_ptr;    /* 下一筆要寫的位址 */
 static uint32_t s_next_id;      /* 下一筆的 rec_id */
 static uint32_t s_count;        /* 目前總筆數 */
 static uint32_t s_bad_addr;
+
+static uint32_t s_last_append_us;
+static uint32_t s_last_read_us;
+static uint32_t s_last_init_us;
 
 /* CRC 涵蓋 header(不含 crc32 欄位本身)+ payload */
 static uint32_t record_crc(const rec_header_t *h, const uint8_t *payload)
@@ -49,6 +54,7 @@ static int record_verify(uint32_t addr, rec_header_t *h)
 /* 掃描 flash，找出 log 尾端 */
 log_status_t log_init(void)
 {
+	uint32_t     t0   = perf_cycles();
     uint32_t     addr = LOG_AREA_START;
     rec_header_t h;
 
@@ -75,6 +81,8 @@ log_status_t log_init(void)
     }
 
     s_write_ptr = addr;
+    s_last_init_us = perf_us_since(t0);
+
     log_printf("[LOG ] init: %u records, wp=0x%06X, next_id=%u%s\r\n",
                (unsigned)s_count, (unsigned)s_write_ptr, (unsigned)s_next_id,
                s_bad_addr ? " (recovered)" : "");
@@ -103,6 +111,8 @@ log_status_t log_append(const uint8_t *data, uint16_t len)
     memcpy(buf + sizeof(h), data, len);
 
     /* 逐頁寫入，處理跨頁 */
+    uint32_t t0   = perf_cycles();
+
     uint32_t addr = s_write_ptr;
     uint32_t off  = 0;
     while (off < total) {
@@ -115,6 +125,7 @@ log_status_t log_append(const uint8_t *data, uint16_t len)
         addr += chunk;
         off  += chunk;
     }
+    s_last_append_us = perf_us_since(t0);
 
     s_write_ptr += total;
     s_next_id++;
@@ -124,6 +135,7 @@ log_status_t log_append(const uint8_t *data, uint16_t len)
 
 log_status_t log_read(uint32_t rec_id, uint8_t *buf, uint16_t *len)
 {
+	uint32_t     t0   = perf_cycles();
     uint32_t     addr = LOG_AREA_START;
     rec_header_t h;
 
@@ -139,6 +151,8 @@ log_status_t log_read(uint32_t rec_id, uint8_t *buf, uint16_t *len)
         }
         addr += sizeof(h) + h.length;
     }
+
+    s_last_read_us = perf_us_since(t0);
     return LOG_ERR_NOTFOUND;
 }
 
@@ -174,6 +188,9 @@ void log_stats(void)
     log_printf("[LOG ] records=%u used=%u B wp=0x%06X next_id=%u\r\n",
                (unsigned)s_count, (unsigned)used,
                (unsigned)s_write_ptr, (unsigned)s_next_id);
+    log_printf("[LOG ] last_append_us=%u last_read_us=%u init_us=%u\r\n",
+               (unsigned)s_last_append_us, (unsigned)s_last_read_us,
+               (unsigned)s_last_init_us);
 }
 
 /* 清空 log 區（目前只擦前 16 個 sector = 64KB，夠測試用） */
@@ -241,3 +258,7 @@ log_status_t log_inject_partial(const uint8_t *data, uint16_t len)
                (unsigned)s_write_ptr, half, len);
     return LOG_OK;
 }
+
+uint32_t log_last_append_us(void) { return s_last_append_us; }
+uint32_t log_last_read_us(void)   { return s_last_read_us; }
+uint32_t log_last_init_us(void)   { return s_last_init_us; }

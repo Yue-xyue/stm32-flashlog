@@ -42,4 +42,8 @@ log_status_t log_format(void);
 log_status_t log_inject_corrupt(void);
 log_status_t log_inject_partial(const uint8_t *data, uint16_t len);
 
+uint32_t log_last_append_us(void);
+uint32_t log_last_read_us(void);
+uint32_t log_last_init_us(void);
+
 #endif /* INC_LOG_H_ */
