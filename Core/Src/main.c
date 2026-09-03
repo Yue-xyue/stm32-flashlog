@@ -28,6 +28,7 @@
 #include "storage.h"
 #include "cmd.h"
 #include "log.h"
+#include "perf.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -115,6 +116,7 @@ int main(void)
   MX_USART2_UART_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
+  perf_init();
   flash_init(&hspi1);
   log_init();
   printf("FlashLog boot OK (build %s %s)\r\n", __DATE__, __TIME__);
@@ -239,7 +241,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -333,13 +335,16 @@ void StartStorageTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
   storage_req_t req;
-  uint8_t buf[16];
+  uint8_t buf[64];
+  int rc;                       /* result of request */
 
   /* Infinite loop */
   for(;;)
   {
 	  if (osMessageQueueGet(storageQueueHandle, &req, NULL, osWaitForever) != osOK)
 	    continue;
+
+	  rc = 0;                     /* 預設成功 */
 
       switch (req.type)
       {
@@ -350,28 +355,33 @@ void StartStorageTask(void *argument)
           break;
         }
         case REQ_ERASE:
+          rc = flash_sector_erase(req.addr);
           log_printf("[STOR] erase @0x%06X: %s\r\n", (unsigned)req.addr,
-                     flash_sector_erase(req.addr) == FL_OK ? "OK" : "TIMEOUT");
+        	         rc == FL_OK ? "OK" : "TIMEOUT");
           break;
 
         case REQ_WRITE:
+          rc = flash_page_program(req.addr, req.data, req.len);
           log_printf("[STOR] write %u B @0x%06X: %s\r\n", req.len, (unsigned)req.addr,
-                     flash_page_program(req.addr, req.data, req.len) == FL_OK ? "OK" : "FAIL");
+        	         rc == FL_OK ? "OK" : "FAIL");
           break;
 
-        case REQ_READ:
-          flash_read(req.addr, buf, req.len);
-          dump_hex("[STOR] read", buf, req.len);
+        case REQ_READ: {
+          uint16_t n = (req.len > sizeof(buf)) ? sizeof(buf) : req.len;
+          flash_read(req.addr, buf, n);
+          dump_hex("[STOR] read", buf, n);
           break;
+        }
         case REQ_LOG_WRITE:
-          log_printf("[STOR] log append %u B: %s\r\n", req.len,
-                             log_append(req.data, req.len) == LOG_OK ? "OK" : "FAIL");
+          rc = log_append(req.data, req.len);
+          log_printf("[STOR] log append %u B\r\n", req.len);
           break;
 
         case REQ_LOG_READ: {
           uint8_t  p[LOG_MAX_PAYLOAD + 1];
           uint16_t n = LOG_MAX_PAYLOAD;
-          if (log_read(req.addr, p, &n) == LOG_OK) {
+          rc = log_read(req.addr, p, &n);
+          if (rc == LOG_OK) {
             p[n] = '\0';
             log_printf("[STOR] rec %u: \"%s\"\r\n", (unsigned)req.addr, p);
           } else {
@@ -383,12 +393,17 @@ void StartStorageTask(void *argument)
         case REQ_LOG_DUMP:   log_dump();  break;
         case REQ_LOG_STATS:  log_stats(); break;
         case REQ_LOG_FORMAT:
-          log_printf("[STOR] format: %s\r\n",
-                     log_format() == LOG_OK ? "OK" : "FAIL");
+          rc = log_format();
+          log_printf("[STOR] format: %s\r\n", rc == LOG_OK ? "OK" : "FAIL");
           break;
-        case REQ_LOG_CORRUPT:  log_inject_corrupt();  break;
-        case REQ_LOG_PARTIAL:  log_inject_partial(req.data, req.len); break;
+        case REQ_LOG_CORRUPT:  rc = log_inject_corrupt();  break;
+        case REQ_LOG_PARTIAL:  rc = log_inject_partial(req.data, req.len); break;
+        case REQ_LOG_REMOUNT:  rc = log_init();  break;
       }
+
+      /* 統一的結束標記 */
+      if (rc == 0) log_printf("OK\r\n");
+      else         log_printf("ERR %d\r\n", -rc);   /* 錯誤碼是負的，轉成正數 */
 
       uart_puts_raw("FlashLog> ");
   }

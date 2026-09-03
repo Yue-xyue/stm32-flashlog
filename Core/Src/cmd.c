@@ -77,6 +77,7 @@ void parse_and_dispatch(char *line)
                 if (req.len > sizeof(req.data)) req.len = sizeof(req.data);
                 memcpy(req.data, t, req.len);
             }
+            else if (strcmp(sub, "remount") == 0) req.type = REQ_LOG_REMOUNT;
             else { log_printf("unknown: log %s\r\n", sub); return; }
     }
 
