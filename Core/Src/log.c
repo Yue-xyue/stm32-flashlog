@@ -12,6 +12,7 @@
 #include <string.h>
 #include "crc32.h"
 #include "perf.h"
+#include "wear.h"
 
 static uint32_t s_write_ptr;    /* 下一筆要寫的位址 */
 static uint32_t s_next_id;      /* 下一筆的 rec_id */
@@ -283,6 +284,7 @@ log_status_t log_append(const uint8_t *data, uint16_t len)
 
             uint32_t te = perf_cycles();
             if (flash_sector_erase(next_sec) != FL_OK) return LOG_ERR_IO;
+            wear_record_erase(sector_index(next_sec));
             s_last_erase_us = perf_us_since(te);
             s_erase_count++;
 

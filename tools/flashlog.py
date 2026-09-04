@@ -202,6 +202,12 @@ def cmd_scaling(fl, args):
 
     return 0
 
+def cmd_wear(fl, args):
+    ok, code, lines = fl.send('log wear')
+    for l in lines:
+        print(l)
+    return 0 if ok else 1
+
 def main():
     p = argparse.ArgumentParser(description='FlashLog host CLI')
     p.add_argument('--port', default='COM3')
@@ -237,6 +243,9 @@ def main():
     sp.add_argument('--size', type=int, default=16)
     sp.add_argument('--csv')
     sp.set_defaults(func=cmd_scaling)
+
+    sp = sub.add_parser('wear', help='show per-sector erase counts')
+    sp.set_defaults(func=cmd_wear)
 
     args = p.parse_args()
 

@@ -46,7 +46,9 @@ void uart_putc_raw(char c)
 
 void uart_puts_raw(const char *s)
 {
+    osMutexAcquire(uartMutexHandle, osWaitForever);
     while (*s) uart_putc_raw(*s++);
+    osMutexRelease(uartMutexHandle);
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)

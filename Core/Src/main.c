@@ -29,6 +29,7 @@
 #include "cmd.h"
 #include "log.h"
 #include "perf.h"
+#include "wear.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -118,6 +119,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
   perf_init();
   flash_init(&hspi1);
+  wear_init();
   log_init();
   printf("FlashLog boot OK (build %s %s)\r\n", __DATE__, __TIME__);
   /* USER CODE END 2 */
@@ -399,6 +401,18 @@ void StartStorageTask(void *argument)
         case REQ_LOG_CORRUPT:  rc = log_inject_corrupt();  break;
         case REQ_LOG_PARTIAL:  rc = log_inject_partial(req.data, req.len); break;
         case REQ_LOG_REMOUNT:  rc = log_init();  break;
+        case REQ_LOG_WEAR: {
+          wear_stats_t w;
+          wear_get(&w);
+          log_printf("[WEAR] total=%u min=%u max=%u spread=%u events=%u/%u\r\n",
+                     (unsigned)w.total, (unsigned)w.min, (unsigned)w.max,
+                     (unsigned)(w.max - w.min),
+                     (unsigned)w.events_used, (unsigned)(FLASH_SECTOR_SIZE / 4));
+          for (uint32_t i = 0; i < WEAR_MAX_SECTORS; i++)
+            log_printf("  S%-2u : %u\r\n", (unsigned)i, (unsigned)w.count[i]);
+          break;
+        }
+        case REQ_WEAR_RESET:  wear_reset();  break;
       }
 
       /* 統一的結束標記 */
@@ -436,13 +450,21 @@ void StartCommandTask(void *argument)
       uart_puts_raw("\r\n");
       if (len > 0) {
         line[len] = '\0';
-        parse_and_dispatch(line);
+        if (parse_and_dispatch(line) == 0) {
+          log_printf("OK\r\n");              /* 本地處理完成，自己給結束標記 */
+          uart_puts_raw("FlashLog> ");
+        }
         len = 0;
+      }
+      else {
+        uart_puts_raw("FlashLog> ");         /* 空行也要給提示字元 */
       }
       /* 提示字元不在這裡印，改由 storageTask 處理完後印 */
     }
     else if (ch == 0x08 || ch == 0x7F) {
-      if (len > 0) { len--; uart_puts_raw("\b \b"); }
+      if (len > 0) {
+    	  len--; uart_puts_raw("\b \b");
+      }
     }
     else if (len < (int)sizeof(line) - 1) {
       line[len++] = (char)ch;

@@ -24,5 +24,4 @@ void uart_putc_raw(char c);
 void uart_puts_raw(const char *s);
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
 
-
 #endif /* INC_LOG_UART_H_ */
