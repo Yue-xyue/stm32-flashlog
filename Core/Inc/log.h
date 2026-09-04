@@ -12,8 +12,12 @@
 #include "flash.h"
 
 #define LOG_MAGIC        0x464C5247u   /* "FLRG" */
+#define LOG_MAGIC_PAD    0x50414421u   /* "PAD!" — 填補 record */
+
 #define LOG_AREA_START   0x001000u     /* sector 0 保留給 metadata */
-#define LOG_AREA_END     0x1000000u    /* 16MB */
+#define LOG_SECTOR_COUNT 16
+#define LOG_AREA_END     (LOG_AREA_START + LOG_SECTOR_COUNT * FLASH_SECTOR_SIZE)
+
 #define LOG_MAX_PAYLOAD  64
 
 typedef struct __attribute__((packed)) {

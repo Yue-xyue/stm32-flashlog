@@ -51,36 +51,81 @@ static int record_verify(uint32_t addr, rec_header_t *h)
     return (record_crc(&tmp, payload) == want);
 }
 
+/* 本 sector 的結束位址（＝下一個 sector 的起點） */
+static uint32_t sector_end_of(uint32_t addr)
+{
+    return (addr / FLASH_SECTOR_SIZE + 1) * FLASH_SECTOR_SIZE;
+}
+
+/* 在 addr 處寫一筆 PAD record，宣告「本 sector 剩下的不用了」 */
+static log_status_t write_pad(uint32_t addr)
+{
+    uint32_t end  = sector_end_of(addr);
+    uint32_t left = end - addr;
+
+    if (left < sizeof(rec_header_t)) return LOG_OK;   /* 放不下 header，留 FF */
+
+    rec_header_t h;
+    h.magic     = LOG_MAGIC_PAD;
+    h.rec_id    = 0;
+    h.length    = 0;
+    h.reserved  = 0;
+    h.timestamp = HAL_GetTick();
+    h.crc32     = 0;
+
+    if (flash_page_program(addr, (const uint8_t *)&h, sizeof(h)) != FL_OK)
+        return LOG_ERR_IO;
+    return LOG_OK;
+}
+
+/* 從 addr 開始，找出下一筆有效 record 的位址。
+   回傳 0 表示沒有更多了。 */
+static uint32_t next_record(uint32_t addr, uint32_t limit, rec_header_t *h)
+{
+    while (addr < limit) {
+        uint32_t sec_end = sector_end_of(addr);
+
+        if (sec_end - addr < sizeof(*h)) { addr = sec_end; continue; }
+
+        flash_read(addr, (uint8_t *)h, sizeof(*h));
+
+        if (h->magic == 0xFFFFFFFFu) return 0;              /* 結束 */
+        if (h->magic == LOG_MAGIC_PAD) { addr = sec_end; continue; }
+        if (h->magic != LOG_MAGIC) return 0;                /* 損毀 */
+
+        return addr;                                         /* 找到了 */
+    }
+    return 0;
+}
+
+
 /* 掃描 flash，找出 log 尾端 */
 log_status_t log_init(void)
 {
-	uint32_t     t0   = perf_cycles();
+    uint32_t     t0   = perf_cycles();
     uint32_t     addr = LOG_AREA_START;
+    uint32_t     next = 0;
     rec_header_t h;
 
     s_next_id  = 1;
     s_count    = 0;
-    s_bad_addr = 0;                 /* 新增：記錄損毀位置 */
+    s_bad_addr = 0;
 
-    while (addr + sizeof(h) < LOG_AREA_END) {
-        flash_read(addr, (uint8_t *)&h, sizeof(h));
-
-        if (h.magic == 0xFFFFFFFFu) break;          /* 空白區 = log 尾端 */
-
-        if (!record_verify(addr, &h)) {
-            /* 情況 A 或 B：損毀或寫到一半 */
-            s_bad_addr = addr;
+    while ((next = next_record(addr, LOG_AREA_END, &h)) != 0) {
+        /* ④ 正常 record → 驗證 */
+        if (!record_verify(next, &h)) {
+            s_bad_addr = next;
             log_printf("[LOG ] corrupt record @0x%06X, truncating here\r\n",
-                       (unsigned)addr);
+                       (unsigned)next);
             break;
         }
 
         s_count++;
         s_next_id = h.rec_id + 1;
-        addr += sizeof(h) + h.length;
+        addr = next + sizeof(h) + h.length;
     }
 
-    s_write_ptr = addr;
+    s_write_ptr    = addr;
     s_last_init_us = perf_us_since(t0);
 
     log_printf("[LOG ] init: %u records, wp=0x%06X, next_id=%u%s\r\n",
@@ -94,7 +139,15 @@ log_status_t log_append(const uint8_t *data, uint16_t len)
     if (data == NULL || len == 0 || len > LOG_MAX_PAYLOAD) return LOG_ERR_PARAM;
 
     uint32_t total = sizeof(rec_header_t) + len;
-    if (s_write_ptr + total >= LOG_AREA_END) return LOG_ERR_FULL;
+
+    /* ---- 本 sector 放不下這筆 → 填 PAD、跳到下個 sector ---- */
+    if (s_write_ptr + total > sector_end_of(s_write_ptr)) {
+        if (write_pad(s_write_ptr) != LOG_OK) return LOG_ERR_IO;
+        s_write_ptr = sector_end_of(s_write_ptr);
+    }
+
+    /* ---- 整個 log 區滿了（第一步先不回收） ---- */
+    if (s_write_ptr + total > LOG_AREA_END) return LOG_ERR_FULL;
 
     rec_header_t h;
     h.magic     = LOG_MAGIC;
@@ -102,26 +155,22 @@ log_status_t log_append(const uint8_t *data, uint16_t len)
     h.length    = len;
     h.reserved  = 0;
     h.timestamp = HAL_GetTick();
-    h.crc32 	= 0;                          /* 先歸零，避免殘值影響計算 */
-    h.crc32 	= record_crc(&h, data);       /* 再算真正的值 */
+    h.crc32     = 0;
+    h.crc32     = record_crc(&h, data);
 
-    /* 組成一塊連續 buffer，減少寫入次數 */
     uint8_t buf[sizeof(rec_header_t) + LOG_MAX_PAYLOAD];
     memcpy(buf, &h, sizeof(h));
     memcpy(buf + sizeof(h), data, len);
 
-    /* 逐頁寫入，處理跨頁 */
+    /* 逐頁寫入（record 保證不跨 sector，但仍可能跨 page） */
     uint32_t t0   = perf_cycles();
-
     uint32_t addr = s_write_ptr;
     uint32_t off  = 0;
     while (off < total) {
         uint32_t page_left = FLASH_PAGE_SIZE - (addr % FLASH_PAGE_SIZE);
         uint32_t chunk     = (total - off < page_left) ? (total - off) : page_left;
-
         if (flash_page_program(addr, buf + off, (uint16_t)chunk) != FL_OK)
             return LOG_ERR_IO;
-
         addr += chunk;
         off  += chunk;
     }
@@ -139,14 +188,12 @@ log_status_t log_read(uint32_t rec_id, uint8_t *buf, uint16_t *len)
     uint32_t     addr = LOG_AREA_START;
     rec_header_t h;
 
-    while (addr < s_write_ptr) {
-        flash_read(addr, (uint8_t *)&h, sizeof(h));
-        if (h.magic != LOG_MAGIC) break;
-
+    while ((addr = next_record(addr, s_write_ptr, &h)) != 0) {
         if (h.rec_id == rec_id) {
             uint16_t n = (h.length < *len) ? h.length : *len;
             flash_read(addr + sizeof(h), buf, n);
             *len = n;
+            s_last_read_us = perf_us_since(t0);
             return LOG_OK;
         }
         addr += sizeof(h) + h.length;
@@ -164,9 +211,7 @@ void log_dump(void)
 
     if (s_count == 0) { log_printf("[LOG ] (empty)\r\n"); return; }
 
-    while (addr < s_write_ptr) {
-        flash_read(addr, (uint8_t *)&h, sizeof(h));
-        if (h.magic != LOG_MAGIC) break;
+    while ((addr = next_record(addr, s_write_ptr, &h)) != 0) {
 
         int ok = record_verify(addr, &h);
         uint16_t n = (h.length > LOG_MAX_PAYLOAD) ? LOG_MAX_PAYLOAD : h.length;
@@ -196,10 +241,9 @@ void log_stats(void)
 /* 清空 log 區（目前只擦前 16 個 sector = 64KB，夠測試用） */
 log_status_t log_format(void)
 {
-    for (uint32_t a = LOG_AREA_START; a < LOG_AREA_START + 16 * FLASH_SECTOR_SIZE;
-         a += FLASH_SECTOR_SIZE) {
-        if (flash_sector_erase(a) != FL_OK) return LOG_ERR_IO;
-    }
+	for (uint32_t a = LOG_AREA_START; a < LOG_AREA_END; a += FLASH_SECTOR_SIZE) {
+	    if (flash_sector_erase(a) != FL_OK) return LOG_ERR_IO;
+	}
     s_write_ptr = LOG_AREA_START;
     s_next_id   = 1;
     s_count     = 0;
