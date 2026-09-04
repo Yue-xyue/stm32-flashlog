@@ -65,7 +65,13 @@ void parse_and_dispatch(char *line)
                 req.type = REQ_LOG_READ;
                 req.addr = strtoul(i, NULL, 0);      /* 借 addr 欄位放 rec_id */
             }
-            else if (strcmp(sub, "dump") == 0)   req.type = REQ_LOG_DUMP;
+            else if (strcmp(sub, "dump") == 0) {
+                        char *a = strtok(NULL, " ");
+                        char *b = strtok(NULL, " ");
+                        req.type = REQ_LOG_DUMP;
+                        req.addr = a ? strtoul(a, NULL, 0) : 0;    /* start_id */
+                        req.len  = b ? strtoul(b, NULL, 0) : 20;   /* count */
+                    }
             else if (strcmp(sub, "stats") == 0)  req.type = REQ_LOG_STATS;
             else if (strcmp(sub, "format") == 0) req.type = REQ_LOG_FORMAT;
             else if (strcmp(sub, "corrupt") == 0) req.type = REQ_LOG_CORRUPT;

@@ -390,7 +390,7 @@ void StartStorageTask(void *argument)
           break;
         }
 
-        case REQ_LOG_DUMP:   log_dump();  break;
+        case REQ_LOG_DUMP:   log_dump(req.addr, req.len);  break;
         case REQ_LOG_STATS:  log_stats(); break;
         case REQ_LOG_FORMAT:
           rc = log_format();

@@ -40,7 +40,7 @@ typedef enum {
 log_status_t log_init(void);
 log_status_t log_append(const uint8_t *data, uint16_t len);
 log_status_t log_read(uint32_t rec_id, uint8_t *buf, uint16_t *len);
-void         log_dump(void);
+void 		 log_dump(uint32_t start_id, uint32_t count);
 void         log_stats(void);
 log_status_t log_format(void);
 log_status_t log_inject_corrupt(void);
@@ -49,5 +49,7 @@ log_status_t log_inject_partial(const uint8_t *data, uint16_t len);
 uint32_t log_last_append_us(void);
 uint32_t log_last_read_us(void);
 uint32_t log_last_init_us(void);
+
+
 
 #endif /* INC_LOG_H_ */

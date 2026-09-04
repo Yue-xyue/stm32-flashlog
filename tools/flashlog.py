@@ -70,7 +70,8 @@ def cmd_write(fl, args):
 
 
 def cmd_dump(fl, args):
-    ok, code, lines = fl.send('log dump')
+    cmd = f'log dump {args.start} {args.count}'
+    ok, code, lines = fl.send(cmd)
     for l in lines:
         print(l)
     return 0 if ok else 1
@@ -212,7 +213,9 @@ def main():
     sp.add_argument('--count', type=int, default=1)
     sp.set_defaults(func=cmd_write)
 
-    sp = sub.add_parser('dump', help='list all records')
+    sp = sub.add_parser('dump', help='list records')
+    sp.add_argument('--start', type=int, default=0, help='start rec_id (0 = last N)')
+    sp.add_argument('--count', type=int, default=20)
     sp.set_defaults(func=cmd_dump)
 
     sp = sub.add_parser('stats', help='show log stats')
