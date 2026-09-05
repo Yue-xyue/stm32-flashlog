@@ -1,0 +1,5 @@
+Drivers/**     linguist-vendored
+Middlewares/** linguist-vendored
+
+* text=auto eol=lf
+*.png binary
