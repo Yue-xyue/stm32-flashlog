@@ -38,6 +38,7 @@ typedef enum {
     LOG_ERR_FULL    = -2,
     LOG_ERR_IO      = -3,
     LOG_ERR_NOTFOUND= -4,
+	LOG_ERR_CRC = -5,
 } log_status_t;
 
 log_status_t log_init(void);

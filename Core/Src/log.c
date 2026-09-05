@@ -178,16 +178,20 @@ static uint32_t iter_next(log_iter_t *it, rec_header_t *h)
     return 0;
 }
 
-/* 走訪全部 record 並計數。O(n)，只在需要時呼叫 */
-static uint32_t count_records(void)
+/* 走訪全部 record，分別計算有效與損毀的筆數 */
+static void count_records(uint32_t *valid, uint32_t *corrupt)
 {
     log_iter_t   it;
     rec_header_t h;
-    uint32_t     n = 0;
+    uint32_t     addr;
 
+    *valid = *corrupt = 0;
     iter_begin(&it);
-    while (iter_next(&it, &h) != 0) n++;
-    return n;
+    while ((addr = iter_next(&it, &h)) != 0) {
+        rec_header_t tmp = h;
+        if (record_verify(addr, &tmp)) (*valid)++;
+        else                           (*corrupt)++;
+    }
 }
 
 static void print_record(uint32_t addr, const rec_header_t *h)
@@ -234,6 +238,7 @@ log_status_t log_init(void)
     log_iter_t   it;
     rec_header_t h;
     uint32_t     addr;
+    uint32_t valid, corrupt;
 
     s_next_id  = 1;
     s_bad_addr = 0;
@@ -246,7 +251,9 @@ log_status_t log_init(void)
     while ((addr = iter_next(&it, &h)) != 0) {
         if (!record_verify(addr, &h)) {
             s_bad_addr = addr;
-            last_end   = addr;
+            if (h.rec_id >= s_next_id && h.rec_id < s_next_id + 1000)
+            	s_next_id = h.rec_id + 1;
+            last_end = next_sector_addr(addr);
             log_printf("[LOG ] corrupt record @0x%06X\r\n", (unsigned)addr);
             break;
         }
@@ -255,11 +262,13 @@ log_status_t log_init(void)
     }
 
     s_write_ptr    = last_end;
+    s_active_addr  = s_write_ptr & ~(FLASH_SECTOR_SIZE - 1);
     s_last_init_us = perf_us_since(t0);
 
-    log_printf("[LOG ] init: %u records, wp=0x%06X, next_id=%u "
+    count_records(&valid, &corrupt);
+    log_printf("[LOG ] init: %u valid, %u corrupt, wp=0x%06X, next_id=%u "
                "oldest=S%u active=S%u%s\r\n",
-			   (unsigned)count_records(), (unsigned)s_write_ptr, (unsigned)s_next_id,
+               (unsigned)valid, (unsigned)corrupt, (unsigned)s_write_ptr, (unsigned)s_next_id,
                (unsigned)sector_index(s_oldest_addr),
                (unsigned)sector_index(s_active_addr),
                s_bad_addr ? " (recovered)" : "");
@@ -339,6 +348,11 @@ log_status_t log_read(uint32_t rec_id, uint8_t *buf, uint16_t *len)
 
     while ((addr = iter_next(&it, &h)) != 0) {
         if (h.rec_id == rec_id) {
+            rec_header_t tmp = h;
+            if (!record_verify(addr, &tmp)) {
+                s_last_read_us = perf_us_since(t0);
+                return LOG_ERR_CRC;
+            }
             uint16_t n = (h.length < *len) ? h.length : *len;
             flash_read(addr + sizeof(h), buf, n);
             *len = n;
@@ -363,8 +377,10 @@ void log_dump(uint32_t start_id, uint32_t count)
     iter_begin(&it);
 
     if (start_id == 0) {
-        uint32_t total = count_records();
-        uint32_t skip  = (total > count) ? (total - count) : 0;
+    	uint32_t valid, corrupt;
+    	count_records(&valid, &corrupt);
+    	uint32_t total = valid + corrupt;      /* dump 要顯示全部，含損毀 */
+    	uint32_t skip  = (total > count) ? (total - count) : 0;
         iter_begin(&it);
         while (skip-- > 0 && iter_next(&it, &h) != 0) { }
     }
@@ -378,10 +394,13 @@ void log_dump(uint32_t start_id, uint32_t count)
 
 void log_stats(void)
 {
+	uint32_t valid, corrupt;
+	count_records(&valid, &corrupt);
+
 	uint32_t sectors_used = (sector_index(s_active_addr) - sector_index(s_oldest_addr)
 	                         + LOG_SECTOR_COUNT) % LOG_SECTOR_COUNT + 1;
-	log_printf("[LOG ] records=%u sectors=%u/%u wp=0x%06X next_id=%u\r\n",
-			   (unsigned)count_records(), (unsigned)sectors_used, LOG_SECTOR_COUNT,
+	log_printf("[LOG ] records=%u corrupt=%u sectors=%u/%u wp=0x%06X next_id=%u\r\n",
+	           (unsigned)valid, (unsigned)corrupt, (unsigned)sectors_used, LOG_SECTOR_COUNT,
 	           (unsigned)s_write_ptr, (unsigned)s_next_id);
     log_printf("[LOG ] last_append_us=%u last_read_us=%u init_us=%u\r\n",
                (unsigned)s_last_append_us, (unsigned)s_last_read_us,
