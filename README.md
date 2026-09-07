@@ -17,7 +17,7 @@ STM32 + FreeRTOS + SPI NOR Flash 上的 append-only 日誌儲存韌體，
 | | |
 |---|---|
 | MCU 板 | STM32 Nucleo-F446RE |
-| Flash | SPI NOR 16 MB（實測為 XTX XT25F128B，JEDEC ID `0B 40 18`） |
+| Flash | SPI NOR 16 MB |
 | RTOS | FreeRTOS（CMSIS-RTOS v2） |
 | 工具鏈 | STM32CubeMX + STM32CubeIDE |
  
