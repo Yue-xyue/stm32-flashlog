@@ -106,6 +106,11 @@ void flash_read(uint32_t addr, uint8_t *buf, uint32_t len)
 {
     CS_LOW();
     send_cmd_addr(CMD_READ_DATA, addr);
-    HAL_SPI_Receive(s_hspi, buf, len, HAL_MAX_DELAY);
+    while (len > 0) {
+        uint16_t chunk = (len > 0xFFFFu) ? 0xFFFFu : (uint16_t)len;
+        HAL_SPI_Receive(s_hspi, buf, chunk, HAL_MAX_DELAY);
+        buf += chunk;
+        len -= chunk;
+    }
     CS_HIGH();
 }
