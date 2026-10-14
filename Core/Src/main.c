@@ -39,6 +39,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define BUSY_TEST_ADDR  0x100000u   /* busyreset 擦的 sector：1 MB 處，log 區、wear 區都用不到 */
 
 /* USER CODE END PD */
 
@@ -416,6 +417,14 @@ void StartStorageTask(void *argument)
         case REQ_LOG_TORNHDR: rc = log_inject_torn_header(); break;
         case REQ_LOG_PADCUT:  rc = log_inject_pad_cut();     break;
         case REQ_LOG_FILL:    rc = log_fill(req.addr, req.len); break;
+        case REQ_BUSY_RESET:
+          /* 測試用：送出擦除後不等做完，馬上軟體 reset（跟 watchdog 一樣只重置 MCU）。
+             flash 會繼續擦，開機時 flash_init 要等它做完才讀 */
+          log_printf("[STOR] erase @0x%06X, reset before it finishes\r\n", (unsigned)BUSY_TEST_ADDR);
+          while ((USART2->SR & USART_SR_TC) == 0) { }   /* 等最後一個字送完 */
+          flash_sector_erase_start(BUSY_TEST_ADDR);
+          NVIC_SystemReset();
+          break;
       }
 
       /* 統一的結束標記 */

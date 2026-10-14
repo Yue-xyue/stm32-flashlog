@@ -107,6 +107,18 @@ fl_status_t flash_sector_erase(uint32_t addr)
     return wait_ready(BUSY_MAX_MS);   /* erase 慢，逾時給足 */
 }
 
+/* 測試用：送出擦除指令就回來，不等它做完。
+   接著軟體 reset，就是「watchdog 在擦除中途重置 MCU」：flash 會自己把擦除做完，開機時還在忙 */
+fl_status_t flash_sector_erase_start(uint32_t addr)
+{
+    if (wait_ready(BUSY_MAX_MS) != FL_OK) return FL_ERR_TIMEOUT;
+    write_enable();
+    CS_LOW();
+    send_cmd_addr(CMD_SECTOR_ERASE, addr);
+    CS_HIGH();
+    return FL_OK;
+}
+
 fl_status_t flash_page_program(uint32_t addr, const uint8_t *data, uint16_t len)
 {
     if (data == NULL || len == 0 || len > FLASH_PAGE_SIZE) return FL_ERR_PARAM;

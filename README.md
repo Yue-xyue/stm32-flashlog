@@ -57,7 +57,7 @@ write pointer、最舊／最新 sector、next_id 都不存在 flash 上，開機
 
 另外兩件和恢復有關的事：
 
-- **開機先等 flash**：reset 鍵、watchdog、重新燒錄都只重置 MCU，flash 可能還在擦。`flash_init()` 先等 WIP 清掉（最多 2 秒）才讓 wear、log 去讀，有等到會印 `[FLSH] busy at boot, waited N ms`。寫入、擦除也改成送指令前先等
+- **開機先等 flash**：reset 鍵、watchdog、重新燒錄都只重置 MCU，flash 可能還在擦。`flash_init()` 先等 WIP 清掉（最多 2 秒）才讓 wear、log 去讀，有等到會印 `[FLSH] busy at boot, waited N ms`；板子上用 `busyreset` 驗證。寫入、擦除也改成送指令前先等
 - **執行中寫入或擦除失敗**（例如 SPI 逾時）：當成斷電處理，停止寫入，`log remount` 或重開時由 `log_init()` 從 flash 重新判斷位置和編號，不在執行中猜 flash 上寫了多少
  
 ## 使用
@@ -74,6 +74,7 @@ FlashLog> help
   log corrupt | log partial <text>      # 故障注入：payload 壞掉、寫到一半
   log tornhdr | log padcut              # 故障注入：header 寫到一半、換 sector 時 PAD 寫完就斷電
   log fill <count> <len>                # 連續寫入，用來測剛好寫滿、繞一圈
+  busyreset                             # 測試：送出擦除後馬上軟體 reset（模擬 watchdog 在擦除中途重置）
 ```
  
 Host CLI：

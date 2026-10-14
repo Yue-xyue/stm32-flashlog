@@ -29,6 +29,7 @@ typedef enum {
 	REQ_LOG_TORNHDR,
 	REQ_LOG_PADCUT,
 	REQ_LOG_FILL,
+	REQ_BUSY_RESET,
 } req_type_t;
 
 typedef struct {

@@ -18,7 +18,7 @@ int parse_and_dispatch(char *line)
     if (cmd == NULL) return 0;
 
     if (strcmp(cmd, "help") == 0) {
-        log_printf("  id | erase <addr> | write <addr> <text> | read <addr> <len>\r\n"
+        log_printf("  id | erase <addr> | write <addr> <text> | read <addr> <len> | busyreset\r\n"
                    "  log write <text>       | log read <id>\r\n"
                    "  log dump [start] [cnt] | log stats\r\n"
                    "  log format | log remount\r\n"
@@ -29,6 +29,9 @@ int parse_and_dispatch(char *line)
     }
     else if (strcmp(cmd, "id") == 0) {
         req.type = REQ_ID;
+    }
+    else if (strcmp(cmd, "busyreset") == 0) {   /* 測試用：擦除中途軟體 reset */
+        req.type = REQ_BUSY_RESET;
     }
     else if (strcmp(cmd, "erase") == 0) {
         char *a = strtok(NULL, " ");

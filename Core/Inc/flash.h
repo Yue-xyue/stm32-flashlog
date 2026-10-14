@@ -26,6 +26,7 @@ fl_status_t flash_init(SPI_HandleTypeDef *hspi);
 void        flash_read_jedec_id(uint8_t *id);              /* id 需 3 bytes */
 uint8_t     flash_read_status(void);
 fl_status_t flash_sector_erase(uint32_t addr);
+fl_status_t flash_sector_erase_start(uint32_t addr);       /* 測試用：送出擦除指令就回來，不等做完 */
 fl_status_t flash_page_program(uint32_t addr, const uint8_t *data, uint16_t len);
 void        flash_read(uint32_t addr, uint8_t *buf, uint32_t len);
 
