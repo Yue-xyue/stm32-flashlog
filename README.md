@@ -7,7 +7,7 @@ STM32 + FreeRTOS + SPI NOR Flash 上的 append-only 日誌儲存韌體，
 ## 功能
  
 - **Append-only log** — record 不跨 sector 邊界，尾端以 PAD record 填補
-- **斷電復原** — 開機掃描重建狀態，CRC 驗證可偵測寫入中斷的半殘 record
+- **斷電復原** — 開機掃描重建狀態；header 有自己的 CRC-16，壞掉的資料只跳過那個 sector 剩下的部分，不會被當成尾端；換 sector 統一走同一個函式，不是全 FF 就先擦
 - **環形回收** — 寫滿後回收最舊 sector；另提供 STOP 模式（滿了即停、不丟資料）
 - **磨損統計** — 各 sector 擦除次數，以 append-only 事件持久化
 - **雙 task 架構** — CommandTask / StorageTask 經 queue 分派，flash 為 single-owner
@@ -41,11 +41,17 @@ STM32 + FreeRTOS + SPI NOR Flash 上的 append-only 日誌儲存韌體，
 0x001000  log 區 16 × 4 KB   環形使用，寫滿回收最舊 sector
  
 record = header(20 B) + payload(≤64 B)
-header = magic | rec_id | length | reserved | timestamp | crc32
+header = magic | rec_id | length | hcrc | timestamp | crc32
 ```
  
-抹除後的 flash 為全 `FF`，而 magic 不可能是 `0xFFFFFFFF`
-——**第一個讀到 FF 的位置就是 log 尾端**，因此 write pointer 不需另外儲存。
+`hcrc` 是 header 自己的 CRC-16（涵蓋 magic、rec_id、length、timestamp），`crc32` 涵蓋 header 前 16 B 加 payload。
+
+write pointer、最舊／最新 sector、next_id 都不存在 flash 上，開機時掃描推回來：
+
+- **新舊**：每個 sector 第一筆 record 的 rec_id，header 驗得過才拿來排
+- **掃描**：header 可信就用 length 跳下一筆；不可信就放棄這個 sector 剩下的部分，從下一個 sector 開頭繼續（record 不跨 sector，sector 開頭一定是 record 的起點）
+- **尾端**：只在最新的 sector 找，是最後一筆有效 record 之後，而且從那裡到 sector 結尾都必須是 FF；遇到寫到一半的 record、PAD 或其他資料，就當這個 sector 已滿
+- **換 sector**：換 sector、剛好寫滿、開機後的第一筆，全部走 `enter_sector()`：不是全 FF 就先擦，再寫
  
 ## 使用
  
@@ -58,7 +64,9 @@ FlashLog> help
   log dump [start] [cnt] | log stats
   log format | log remount
   log wear   | log wearreset
-  log corrupt | log partial <text>      # 故障注入，用於驗證復原機制
+  log corrupt | log partial <text>      # 故障注入：payload 壞掉、寫到一半
+  log tornhdr | log padcut              # 故障注入：header 寫到一半、換 sector 時 PAD 寫完就斷電
+  log fill <count> <len>                # 連續寫入，用來測剛好寫滿、繞一圈
 ```
  
 Host CLI：
@@ -79,6 +87,29 @@ python plot_gc_latency.py --csv data/gc_latency_full.csv --out ../docs/gc_latenc
  
 每個指令的回應皆以 `OK` 或 `ERR <code>` 結尾，供工具判斷完成時機。
  
+## 斷電測試（PC 上）
+
+`tools/host_test/` 在 PC 上模擬 NOR flash（寫入只能把 1 變 0、以 4 KB sector 擦除），可以在任何一次寫入或擦除的中途斷電，接著重開機（`wear_init()` + `log_init()`）再檢查。檢查不靠 log.c 自己的判斷：直接在 flash 映像裡找 magic 和 CRC32 都對的 record，和「`log_append` 回傳成功的資料」比對。
+
+```bash
+cd tools/host_test
+./run.sh            # 測目前的程式
+./run.sh ec70b1a    # 另外再測改版前的程式，方便比較
+```
+
+| 情境 | 改版前 | 改版後 |
+|---|---|---|
+| 寫到一半斷電，重開一次 | ✓ | ✓ |
+| 再重開一次（壞掉那筆還在 flash 上） | ✗ | ✓ |
+| 中間某筆的 payload 壞掉（位元翻轉） | ✗ | ✓ |
+| 中間某筆的 header 壞掉 | ✗ | ✓ |
+| 繞過一圈後，寫到一半斷電 | ✗ | ✓ |
+| 換 sector 時斷電（PAD 寫完之後） | ✗ | ✓ |
+| 擦到一半斷電（100 種擦法） | ✗ | ✓ |
+| 剛好填滿 sector（不是斷電） | ✗ | ✓ |
+
+隨機斷電：3000 組 × 30 輪，共斷電 34,490 次（其中擦除中途 3,794 次）、重開機 90,000 次，改版後 0 組出錯；改版前 3000 組都會出錯。
+
 ## 量測結果
  
 數據由韌體端 DWT cycle counter（62.5 ns 解析度）量測，經 host CLI 收集為 CSV。
@@ -117,12 +148,13 @@ log 寫滿後量測 1000 次 append（payload 32 B）：
 - **Mount 為 O(n)** — 1593 筆需 1.86 s；根本解法是建立索引，效能優化只能改善常數項
 - **GC 的 62 ms 長尾** — 在飽和寫入下這是硬體邊界；若工作負載有閒置窗口，可用提前擦除迴避，代價是犧牲一個 sector 作為緩衝。
 - `log_format` 固定從 S0 開始，反覆 format 會使前段 sector 磨損較快
-- **Header 缺少獨立的完整性保護** — 單一 CRC32 涵蓋 header 加 payload，因此在驗證之前無法信任 header 的任何欄位。
+- **擦除紀錄的壓縮不是斷電安全的** — 先擦掉再重寫，中途斷電會讓擦除次數歸零；壓縮後也只保留相對次數。改法：兩個 sector 輪流，先寫好新的再擦舊的
 ## 專案結構
  
 ```
 Core/Src/   flash.c  log.c  crc32.c  wear.c  log_uart.c  cmd.c  perf.c  main.c
 tools/      flashlog.py（host CLI）  plot_*.py（繪圖）  data/（量測 CSV）
+            host_test/（PC 上模擬 NOR flash 的斷電測試）
 docs/       量測圖表
 ```
  

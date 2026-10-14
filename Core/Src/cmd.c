@@ -23,7 +23,8 @@ int parse_and_dispatch(char *line)
                    "  log dump [start] [cnt] | log stats\r\n"
                    "  log format | log remount\r\n"
                    "  log wear   | log wearreset\r\n"
-                   "  log corrupt | log partial <text>\r\n");
+                   "  log corrupt | log partial <text>\r\n"
+                   "  log tornhdr | log padcut | log fill <count> <len>\r\n");
         return 0;
     }
     else if (strcmp(cmd, "id") == 0) {
@@ -87,6 +88,16 @@ int parse_and_dispatch(char *line)
             req.len  = strlen(t);
             if (req.len > sizeof(req.data)) req.len = sizeof(req.data);
             memcpy(req.data, t, req.len);
+        }
+        else if (strcmp(sub, "tornhdr") == 0) req.type = REQ_LOG_TORNHDR;
+        else if (strcmp(sub, "padcut") == 0)  req.type = REQ_LOG_PADCUT;
+        else if (strcmp(sub, "fill") == 0) {
+            char *c = strtok(NULL, " ");
+            char *l = strtok(NULL, " ");
+            if (!c || !l) { log_printf("usage: log fill <count> <len>\r\n"); return 0; }
+            req.type = REQ_LOG_FILL;
+            req.addr = strtoul(c, NULL, 0);      /* 借 addr 欄位放筆數 */
+            req.len  = (uint16_t)strtoul(l, NULL, 0);
         }
         else if (strcmp(sub, "remount") == 0) req.type = REQ_LOG_REMOUNT;
         else if (strcmp(sub, "wear") == 0)    req.type = REQ_LOG_WEAR;

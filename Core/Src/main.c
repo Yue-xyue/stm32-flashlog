@@ -413,6 +413,9 @@ void StartStorageTask(void *argument)
           break;
         }
         case REQ_WEAR_RESET:  wear_reset();  break;
+        case REQ_LOG_TORNHDR: rc = log_inject_torn_header(); break;
+        case REQ_LOG_PADCUT:  rc = log_inject_pad_cut();     break;
+        case REQ_LOG_FILL:    rc = log_fill(req.addr, req.len); break;
       }
 
       /* 統一的結束標記 */

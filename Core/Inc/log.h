@@ -27,7 +27,7 @@ typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t rec_id;
     uint16_t length;
-    uint16_t reserved;
+    uint16_t hcrc;        /* header 自己的 CRC-16（原本的 reserved）：驗得過，rec_id 和 length 才可信 */
     uint32_t timestamp;
     uint32_t crc32;
 } rec_header_t;
@@ -49,6 +49,10 @@ void         log_stats(void);
 log_status_t log_format(void);
 log_status_t log_inject_corrupt(void);
 log_status_t log_inject_partial(const uint8_t *data, uint16_t len);
+log_status_t log_inject_torn_header(void);
+log_status_t log_inject_pad_cut(void);
+log_status_t log_fill(uint32_t count, uint16_t len);
+void         log_get_counts(uint32_t *valid, uint32_t *corrupt);
 
 uint32_t log_last_append_us(void);
 uint32_t log_last_read_us(void);

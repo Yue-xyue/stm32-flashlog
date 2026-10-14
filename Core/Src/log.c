@@ -5,20 +5,31 @@
  *      Author: scj
  */
 
-/* log.c — append-only log over SPI NOR flash */
+/* log.c — append-only log over SPI NOR flash
+ *
+ * 斷電恢復的三條規則（2026/10 改版）：
+ *   1. header 自己有 CRC-16（放在原本的 reserved）。驗得過，rec_id 和 length 才拿來用。
+ *   2. 掃描遇到不可信的 header，只放棄那個 sector 剩下的部分，從下一個 sector 開頭繼續。
+ *      record 不跨 sector，所以 sector 開頭一定是 record 的起點。
+ *      尾端只在最新的 sector 裡找，壞掉的資料不再被當成尾端。
+ *   3. 跨進新 sector 只有一個入口 enter_sector()：不是全 FF 就先擦，再寫。
+ *      換 sector、剛好寫滿、開機恢復，全部走這裡。
+ */
 
 #include "log.h"
 #include "log_uart.h"
 #include <string.h>
+#include <stdio.h>
 #include "crc32.h"
 #include "perf.h"
 #include "wear.h"
 
-static uint32_t s_write_ptr;    /* 下一筆要寫的位址 */
-static uint32_t s_next_id;      /* 下一筆的 rec_id */
-static uint32_t s_bad_addr;
-static uint32_t s_oldest_addr;   /* 最舊 sector 的起始位址（下次回收目標） */
+static uint32_t s_write_ptr;     /* 下一筆要寫的位址；等於 sector 結尾代表這個 sector 已滿 */
+static uint32_t s_next_id;       /* 下一筆的 rec_id */
+static uint32_t s_oldest_addr;   /* 最舊 sector 的起始位址（繞一圈時的回收目標） */
 static uint32_t s_active_addr;   /* 目前寫入中的 sector 起始位址 */
+static int      s_have_data;     /* log 裡有沒有任何 record */
+static int      s_recovered;     /* 這次開機有沒有放棄寫壞的尾端 */
 static uint32_t s_erase_count;   /* 本次開機以來的擦除次數（暫存在 RAM） */
 
 static uint32_t s_last_append_us;
@@ -29,13 +40,7 @@ typedef enum { LOG_MODE_CIRCULAR = 0, LOG_MODE_STOP } log_mode_t;
 static log_mode_t s_mode = LOG_MODE_CIRCULAR;
 static uint32_t   s_last_erase_us;
 
-/* 環形迭代器狀態 */
-typedef struct {
-    uint32_t addr;        /* 目前掃描位置 */
-    uint32_t sec_addr;    /* 目前 sector 起點 */
-    uint32_t sec_done;    /* 已走過幾個 sector */
-    int      finished;
-} log_iter_t;
+/* ------------------------------------------------------------------ 位址 */
 
 /* 本 sector 的結束位址（＝下一個 sector 的起點） */
 static uint32_t sector_end_of(uint32_t addr)
@@ -61,148 +66,177 @@ static uint32_t next_sector_addr(uint32_t addr)
     return sector_addr(idx);
 }
 
-/* CRC 涵蓋 header(不含 crc32 欄位本身)+ payload */
+/* ------------------------------------------------------------------ CRC */
+
+/* CRC-16/CCITT-FALSE，只保護 header 本身 */
+static uint16_t crc16_update(uint16_t crc, const uint8_t *p, uint32_t len)
+{
+    while (len--) {
+        crc ^= (uint16_t)((uint16_t)(*p++) << 8);
+        for (int b = 0; b < 8; b++)
+            crc = (crc & 0x8000u) ? (uint16_t)((crc << 1) ^ 0x1021u) : (uint16_t)(crc << 1);
+    }
+    return crc;
+}
+
+/* header 的 CRC：涵蓋 magic、rec_id、length、timestamp（hcrc 自己當 0 算，不含最後的 crc32） */
+static uint16_t header_crc(const rec_header_t *h)
+{
+    rec_header_t tmp = *h;
+    tmp.hcrc = 0;
+    return crc16_update(0xFFFFu, (const uint8_t *)&tmp, sizeof(tmp) - 4);
+}
+
+/* 整筆的 CRC32：header 前 16 bytes（含 hcrc）＋ payload */
 static uint32_t record_crc(const rec_header_t *h, const uint8_t *payload)
 {
     uint32_t crc = 0xFFFFFFFFu;
-    /* header 前 16 bytes：magic..timestamp，剛好排除最後的 crc32 */
     crc = crc32_update(crc, (const uint8_t *)h, sizeof(rec_header_t) - 4);
     crc = crc32_update(crc, payload, h->length);
     return crc ^ 0xFFFFFFFFu;
 }
 
-/* 從 addr 開始，找出下一筆有效 record 的位址。
-   回傳 0 表示沒有更多了。 */
-static uint32_t next_record(uint32_t addr, uint32_t limit, rec_header_t *h)
+/* ------------------------------------------------------------------ flash 輔助 */
+
+/* 照 page 邊界分段寫入（flash_page_program 不能跨頁） */
+static log_status_t program_bytes(uint32_t addr, const uint8_t *buf, uint32_t len)
 {
-    while (addr < limit) {
-        uint32_t sec_end = sector_end_of(addr);
-
-        if (sec_end - addr < sizeof(*h)) { addr = sec_end; continue; }
-
-        flash_read(addr, (uint8_t *)h, sizeof(*h));
-
-        if (h->magic == 0xFFFFFFFFu) return 0;              /* 結束 */
-        if (h->magic == LOG_MAGIC_PAD) { addr = sec_end; continue; }
-        if (h->magic != LOG_MAGIC) return 0;                /* 損毀 */
-
-        return addr;                                         /* 找到了 */
+    while (len > 0) {
+        uint32_t page_left = FLASH_PAGE_SIZE - (addr % FLASH_PAGE_SIZE);
+        uint32_t chunk     = (len < page_left) ? len : page_left;
+        if (flash_page_program(addr, buf, (uint16_t)chunk) != FL_OK) return LOG_ERR_IO;
+        addr += chunk;
+        buf  += chunk;
+        len  -= chunk;
     }
-    return 0;
+    return LOG_OK;
 }
 
-/* 讀出一筆 record 並驗證，回傳是否有效 */
-static int record_verify(uint32_t addr, rec_header_t *h)
+/* [addr, end) 是不是全部都是 FF */
+static int range_is_blank(uint32_t addr, uint32_t end)
 {
-    uint8_t payload[LOG_MAX_PAYLOAD];
+    uint8_t buf[64];
+    while (addr < end) {
+        uint32_t n = end - addr;
+        if (n > sizeof(buf)) n = sizeof(buf);
+        flash_read(addr, buf, n);
+        for (uint32_t i = 0; i < n; i++)
+            if (buf[i] != 0xFF) return 0;
+        addr += n;
+    }
+    return 1;
+}
+
+/* ------------------------------------------------------------------ 讀 header */
+
+typedef enum {
+    HDR_END = 0,   /* 整個 header 都是 FF，或剩下的空間放不下 header：這個 sector 到此為止 */
+    HDR_PAD,       /* PAD：這個 sector 剩下的不用了 */
+    HDR_OK,        /* header 可信：rec_id、length 都能用（payload 另外驗） */
+    HDR_BAD,       /* header 不可信：這個 sector 剩下的都不能信 */
+} hdr_kind_t;
+
+static hdr_kind_t read_header(uint32_t addr, rec_header_t *h)
+{
+    uint32_t sec_end = sector_end_of(addr);
+    if (sec_end - addr < sizeof(*h)) return HDR_END;
 
     flash_read(addr, (uint8_t *)h, sizeof(*h));
 
-    if (h->magic != LOG_MAGIC)          return 0;
-    if (h->length > LOG_MAX_PAYLOAD)    return 0;
-    if (addr + sizeof(*h) + h->length > sector_end_of(addr)) return 0;
+    const uint8_t *p = (const uint8_t *)h;
+    int all_ff = 1;
+    for (uint32_t i = 0; i < sizeof(*h); i++)
+        if (p[i] != 0xFF) { all_ff = 0; break; }
+    if (all_ff) return HDR_END;
 
+    if (h->hcrc != header_crc(h)) return HDR_BAD;            /* header 寫到一半或位元翻轉 */
+    if (h->magic == LOG_MAGIC_PAD) return HDR_PAD;
+    if (h->magic != LOG_MAGIC) return HDR_BAD;
+    if (h->length == 0 || h->length > LOG_MAX_PAYLOAD) return HDR_BAD;
+    if (addr + sizeof(*h) + h->length > sec_end) return HDR_BAD;
+    return HDR_OK;
+}
+
+/* header 已經可信，再驗 payload */
+static int payload_ok(uint32_t addr, const rec_header_t *h)
+{
+    uint8_t payload[LOG_MAX_PAYLOAD];
     flash_read(addr + sizeof(*h), payload, h->length);
-
-    uint32_t want = h->crc32;
-    rec_header_t tmp = *h;
-    tmp.crc32 = 0;
-    return (record_crc(&tmp, payload) == want);
+    return record_crc(h, payload) == h->crc32;
 }
 
-/* 讀某個 sector 的第一筆 record 的 rec_id。
-   回傳 0 表示該 sector 是空的或無效。 */
-static uint32_t sector_first_id(uint32_t sec_addr)
+/* ------------------------------------------------------------------ 走訪 */
+
+/* 從最舊的 sector 走到目前的 sector。init、read、dump、stats 共用同一套規則。 */
+typedef struct {
+    uint32_t sec;      /* 目前 sector 起點 */
+    uint32_t addr;     /* 目前位置 */
+    uint32_t left;     /* 還要走幾個 sector（含目前這個） */
+} log_iter_t;
+
+typedef enum { IT_DONE = 0, IT_RECORD, IT_BAD } it_kind_t;
+
+static uint32_t sectors_in_use(void)
 {
-    rec_header_t h;
-    flash_read(sec_addr, (uint8_t *)&h, sizeof(h));
-
-    if (h.magic != LOG_MAGIC) return 0;   /* FF、PAD、損毀都算空 */
-    return h.rec_id;
-}
-
-/* 巡檢所有 sector，找出最舊與最新（active）。
-   全空時兩者都指向 sector 0。 */
-static void survey_sectors(void)
-{
-    uint32_t min_id = 0xFFFFFFFFu, max_id = 0;
-    uint32_t oldest = LOG_AREA_START, active = LOG_AREA_START;
-    int      found  = 0;
-
-    for (uint32_t i = 0; i < LOG_SECTOR_COUNT; i++) {
-        uint32_t a  = sector_addr(i);
-        uint32_t id = sector_first_id(a);
-        if (id == 0) continue;            /* 空 sector */
-
-        found = 1;
-        if (id < min_id) { min_id = id; oldest = a; }
-        if (id > max_id) { max_id = id; active = a; }
-    }
-
-    if (!found) {                          /* 完全空的 log */
-        s_oldest_addr = LOG_AREA_START;
-        s_active_addr = LOG_AREA_START;
-    } else {
-        s_oldest_addr = oldest;
-        s_active_addr = active;
-    }
+    if (!s_have_data) return 0;
+    return (sector_index(s_active_addr) - sector_index(s_oldest_addr) + LOG_SECTOR_COUNT)
+           % LOG_SECTOR_COUNT + 1;
 }
 
 static void iter_begin(log_iter_t *it)
 {
-    it->addr     = s_oldest_addr;
-    it->sec_addr = s_oldest_addr;
-    it->sec_done = 0;
-    it->finished = 0;
+    it->sec  = s_oldest_addr;
+    it->addr = s_oldest_addr;
+    it->left = sectors_in_use();
 }
 
-/* 取下一筆 record，回傳位址；0 表示走完了 */
-static uint32_t iter_next(log_iter_t *it, rec_header_t *h)
+/* IT_RECORD：*addr 是一筆 header 可信的 record（payload 還沒驗）
+   IT_BAD   ：*addr 的 header 不可信；這個 sector 剩下的已經跳過
+   IT_DONE  ：走完了 */
+static it_kind_t iter_next(log_iter_t *it, uint32_t *addr, rec_header_t *h)
 {
-    while (!it->finished && it->sec_done < LOG_SECTOR_COUNT) {
-        uint32_t sec_end = it->sec_addr + FLASH_SECTOR_SIZE;
-        uint32_t found   = next_record(it->addr, sec_end, h);
-
-        if (found != 0) {
-            it->addr = found + sizeof(*h) + h->length;
-            return found;
+    while (it->left > 0) {
+        /* 最後一筆剛好寫到 sector 結尾時，addr 已經是下一個 sector 的開頭：這個 sector 到此為止 */
+        hdr_kind_t k = (it->addr >= it->sec + FLASH_SECTOR_SIZE) ? HDR_END : read_header(it->addr, h);
+        if (k == HDR_OK) {
+            *addr = it->addr;
+            it->addr += sizeof(*h) + h->length;
+            return IT_RECORD;
         }
 
-        /* 本 sector 走完 */
-        if (it->sec_addr == s_active_addr) { it->finished = 1; break; }
-
-        it->sec_addr = next_sector_addr(it->sec_addr);
-        it->addr     = it->sec_addr;
-        it->sec_done++;
+        /* END / PAD / BAD：這個 sector 結束，換下一個 */
+        uint32_t here = it->addr;
+        it->left--;
+        it->sec  = next_sector_addr(it->sec);
+        it->addr = it->sec;
+        if (k == HDR_BAD) { *addr = here; return IT_BAD; }
     }
-    return 0;
+    return IT_DONE;
 }
 
-/* 走訪全部 record，分別計算有效與損毀的筆數 */
+/* 走訪全部 record，分別計算有效與損毀的筆數（header 不可信的區段算一筆損毀） */
 static void count_records(uint32_t *valid, uint32_t *corrupt)
 {
     log_iter_t   it;
     rec_header_t h;
     uint32_t     addr;
+    it_kind_t    k;
 
     *valid = *corrupt = 0;
     iter_begin(&it);
-    while ((addr = iter_next(&it, &h)) != 0) {
-        rec_header_t tmp = h;
-        if (record_verify(addr, &tmp)) (*valid)++;
-        else                           (*corrupt)++;
+    while ((k = iter_next(&it, &addr, &h)) != IT_DONE) {
+        if (k == IT_RECORD && payload_ok(addr, &h)) (*valid)++;
+        else                                         (*corrupt)++;
     }
 }
 
 static void print_record(uint32_t addr, const rec_header_t *h)
 {
     uint8_t payload[LOG_MAX_PAYLOAD + 1];
-    rec_header_t tmp = *h;
-    int ok = record_verify(addr, &tmp);
-    uint16_t n = (h->length > LOG_MAX_PAYLOAD) ? LOG_MAX_PAYLOAD : h->length;
+    int ok = payload_ok(addr, h);
 
-    flash_read(addr + sizeof(*h), payload, n);
-    payload[n] = '\0';
+    flash_read(addr + sizeof(*h), payload, h->length);
+    payload[h->length] = '\0';
 
     log_printf("  [%u] @0x%06X len=%u t=%u crc=%s \"%s\"\r\n",
                (unsigned)h->rec_id, (unsigned)addr,
@@ -210,155 +244,208 @@ static void print_record(uint32_t addr, const rec_header_t *h)
                ok ? "OK" : "BAD", payload);
 }
 
-/* 在 addr 處寫一筆 PAD record，宣告「本 sector 剩下的不用了」 */
-static log_status_t write_pad(uint32_t addr)
-{
-    uint32_t end  = sector_end_of(addr);
-    uint32_t left = end - addr;
+/* ------------------------------------------------------------------ 換 sector */
 
-    if (left < sizeof(rec_header_t)) return LOG_OK;   /* 放不下 header，留 FF */
+/* 在 addr 處寫一筆 PAD record，宣告「本 sector 剩下的不用了」；sec_end 是這個 sector 的結尾 */
+static log_status_t write_pad(uint32_t addr, uint32_t sec_end)
+{
+    if (addr >= sec_end || sec_end - addr < sizeof(rec_header_t)) return LOG_OK;   /* 放不下 header，留 FF */
 
     rec_header_t h;
     h.magic     = LOG_MAGIC_PAD;
     h.rec_id    = 0;
     h.length    = 0;
-    h.reserved  = 0;
     h.timestamp = HAL_GetTick();
     h.crc32     = 0;
+    h.hcrc      = header_crc(&h);
+    return program_bytes(addr, (const uint8_t *)&h, sizeof(h));
+}
 
-    if (flash_page_program(addr, (const uint8_t *)&h, sizeof(h)) != FL_OK)
-        return LOG_ERR_IO;
+/* 跨進一個新 sector 的唯一入口（format 除外）：
+   不是全 FF 就先擦；擦的是最舊的 sector，代表繞了一圈，最舊往前推一格。 */
+static log_status_t enter_sector(uint32_t sec)
+{
+    int wraps = s_have_data && (sec == s_oldest_addr);
+    if (wraps && s_mode == LOG_MODE_STOP) return LOG_ERR_FULL;
+
+    if (!range_is_blank(sec, sec + FLASH_SECTOR_SIZE)) {
+        uint32_t te = perf_cycles();
+        if (flash_sector_erase(sec) != FL_OK) return LOG_ERR_IO;
+        wear_record_erase(sector_index(sec));
+        s_last_erase_us = perf_us_since(te);
+        s_erase_count++;
+    }
+
+    if (wraps)        s_oldest_addr = next_sector_addr(s_oldest_addr);   /* 那些 record 沒了 */
+    if (!s_have_data) s_oldest_addr = sec;
+    s_active_addr = sec;
+    s_write_ptr   = sec;
     return LOG_OK;
 }
 
-/* 掃描 flash，找出 log 尾端 */
+/* 確保目前的 sector 放得下 total bytes；放不下（含剛好寫滿、開機時判定已滿）就換 sector */
+static log_status_t make_room(uint32_t total)
+{
+    uint32_t sec_end = sector_end_of(s_active_addr);
+    if (s_write_ptr + total <= sec_end) return LOG_OK;
+
+    if (write_pad(s_write_ptr, sec_end) != LOG_OK) return LOG_ERR_IO;
+    return enter_sector(next_sector_addr(s_active_addr));
+}
+
+/* ------------------------------------------------------------------ 開機 */
+
+/* 在最新的 sector 裡找下一筆該寫的位置。
+   *tail: 0 = 正常；1 = 尾端寫到一半或停在 PAD（rec_id 已算進去）；2 = 尾端有讀不出 rec_id 的資料 */
+static uint32_t find_tail(uint32_t sec, int *tail)
+{
+    uint32_t end  = sector_end_of(sec);
+    uint32_t addr = sec;
+    rec_header_t h;
+
+    *tail = 0;
+    while (addr < end) {
+        hdr_kind_t k = read_header(addr, &h);
+        if (k == HDR_OK) {
+            if (!payload_ok(addr, &h)) { *tail = 1; return end; }   /* 寫到一半：這個 sector 不再寫 */
+            addr += sizeof(h) + h.length;
+            continue;
+        }
+        if (k == HDR_PAD) { *tail = 1; return end; }   /* 換 sector 時斷電：PAD 寫了，下一個還沒寫 */
+        if (k == HDR_BAD) { *tail = 2; return end; }   /* header 寫到一半，rec_id 不可信 */
+        break;                                          /* HDR_END */
+    }
+
+    /* 尾端之後到 sector 結尾都必須是 FF，才能接著寫 */
+    if (!range_is_blank(addr, end)) { *tail = 2; return end; }
+    return addr;
+}
+
+/* 掃描 flash，推回 oldest、active、write pointer、next_id（這些都不存在 flash 上） */
 log_status_t log_init(void)
 {
     uint32_t     t0 = perf_cycles();
-    log_iter_t   it;
     rec_header_t h;
-    uint32_t     addr;
-    uint32_t valid, corrupt;
+    uint32_t     valid, corrupt;
 
-    s_next_id  = 1;
-    s_bad_addr = 0;
+    s_next_id   = 1;
+    s_recovered = 0;
+    s_have_data = 0;
 
-    survey_sectors();
-
-    uint32_t last_end = s_oldest_addr;
-    iter_begin(&it);
-
-    while ((addr = iter_next(&it, &h)) != 0) {
-        if (!record_verify(addr, &h)) {
-            s_bad_addr = addr;
-            if (h.rec_id >= s_next_id && h.rec_id < s_next_id + 1000)
-            	s_next_id = h.rec_id + 1;
-            last_end = next_sector_addr(addr);
-            log_printf("[LOG ] corrupt record @0x%06X\r\n", (unsigned)addr);
-            break;
-        }
-        s_next_id = h.rec_id + 1;
-        last_end  = addr + sizeof(h) + h.length;
+    /* 1. 排新舊：只看 header 驗得過的 sector 開頭 */
+    uint32_t min_id = 0, max_id = 0;
+    uint32_t oldest = LOG_AREA_START, newest = LOG_AREA_START;
+    for (uint32_t i = 0; i < LOG_SECTOR_COUNT; i++) {
+        uint32_t a = sector_addr(i);
+        if (read_header(a, &h) != HDR_OK) continue;      /* 空的、壞掉的：不參與排序 */
+        if (!s_have_data || h.rec_id < min_id) { min_id = h.rec_id; oldest = a; }
+        if (!s_have_data || h.rec_id > max_id) { max_id = h.rec_id; newest = a; }
+        s_have_data = 1;
     }
 
-    s_write_ptr    = last_end;
-    s_active_addr  = s_write_ptr & ~(FLASH_SECTOR_SIZE - 1);
+    if (!s_have_data) {
+        /* 沒有任何有效 record。sector 0 不是全 FF 的話，就當它滿了：第一筆寫入時換到下一個，會先擦 */
+        s_oldest_addr = s_active_addr = LOG_AREA_START;
+        s_write_ptr   = LOG_AREA_START;
+        if (!range_is_blank(LOG_AREA_START, sector_end_of(LOG_AREA_START))) {
+            s_write_ptr = sector_end_of(LOG_AREA_START);
+            s_recovered = 1;
+        }
+    } else {
+        s_oldest_addr = oldest;
+        s_active_addr = newest;
+
+        /* 2. 從最舊掃到最新：壞掉的只跳過那個 sector 剩下的，不當成尾端 */
+        log_iter_t it;
+        uint32_t   addr;
+        it_kind_t  k;
+        iter_begin(&it);
+        while ((k = iter_next(&it, &addr, &h)) != IT_DONE) {
+            if (k == IT_RECORD) {
+                if (h.rec_id > max_id) max_id = h.rec_id;
+            } else {
+                log_printf("[LOG ] bad header @0x%06X, skip rest of sector\r\n", (unsigned)addr);
+            }
+        }
+
+        /* 3. 尾端只在最新的 sector 裡找 */
+        int tail;
+        s_write_ptr = find_tail(s_active_addr, &tail);
+        s_next_id   = max_id + 1 + (tail == 2 ? 1 : 0);   /* 讀不出 rec_id 的那筆，編號直接跳過 */
+        s_recovered = (tail != 0);
+    }
+
     s_last_init_us = perf_us_since(t0);
 
     count_records(&valid, &corrupt);
-    log_printf("[LOG ] init: %u valid, %u corrupt, wp=0x%06X, next_id=%u "
+    log_printf("[LOG ] init: %u valid, %u corrupt, wp=0x%06X%s, next_id=%u "
                "oldest=S%u active=S%u%s\r\n",
-               (unsigned)valid, (unsigned)corrupt, (unsigned)s_write_ptr, (unsigned)s_next_id,
+               (unsigned)valid, (unsigned)corrupt, (unsigned)s_write_ptr,
+               (s_write_ptr == sector_end_of(s_active_addr)) ? " (full)" : "",
+               (unsigned)s_next_id,
                (unsigned)sector_index(s_oldest_addr),
                (unsigned)sector_index(s_active_addr),
-               s_bad_addr ? " (recovered)" : "");
+               s_recovered ? " (recovered)" : "");
     return LOG_OK;
 }
+
+/* ------------------------------------------------------------------ 寫入 */
 
 log_status_t log_append(const uint8_t *data, uint16_t len)
 {
     if (data == NULL || len == 0 || len > LOG_MAX_PAYLOAD) return LOG_ERR_PARAM;
 
     uint32_t total = sizeof(rec_header_t) + len;
-
-    /* ---- 本 sector 放不下 → 填 PAD、移到下一個 sector ---- */
-    if (s_write_ptr + total > sector_end_of(s_write_ptr)) {
-        if (write_pad(s_write_ptr) != LOG_OK) return LOG_ERR_IO;
-
-        uint32_t next_sec = next_sector_addr(s_write_ptr);
-
-        /* ---- 下一個就是最舊的 → 繞了一圈，必須回收 ---- */
-        if (next_sec == s_oldest_addr) {
-            if (s_mode == LOG_MODE_STOP) return LOG_ERR_FULL;
-
-            uint32_t te = perf_cycles();
-            if (flash_sector_erase(next_sec) != FL_OK) return LOG_ERR_IO;
-            wear_record_erase(sector_index(next_sec));
-            s_last_erase_us = perf_us_since(te);
-            s_erase_count++;
-
-            /* 最舊往前推一格（那些 record 沒了） */
-            s_oldest_addr = next_sector_addr(s_oldest_addr);
-        }
-
-        s_write_ptr   = next_sec;
-        s_active_addr = next_sec;
-    }
+    log_status_t st = make_room(total);
+    if (st != LOG_OK) return st;
 
     rec_header_t h;
     h.magic     = LOG_MAGIC;
     h.rec_id    = s_next_id;
     h.length    = len;
-    h.reserved  = 0;
     h.timestamp = HAL_GetTick();
     h.crc32     = 0;
-    h.crc32     = record_crc(&h, data);
+    h.hcrc      = header_crc(&h);          /* 先算 header 自己的 CRC */
+    h.crc32     = record_crc(&h, data);    /* 再算整筆的 CRC（含 hcrc） */
 
     uint8_t buf[sizeof(rec_header_t) + LOG_MAX_PAYLOAD];
     memcpy(buf, &h, sizeof(h));
     memcpy(buf + sizeof(h), data, len);
 
     /* 逐頁寫入（record 保證不跨 sector，但仍可能跨 page） */
-    uint32_t t0   = perf_cycles();
-    uint32_t addr = s_write_ptr;
-    uint32_t off  = 0;
-    while (off < total) {
-        uint32_t page_left = FLASH_PAGE_SIZE - (addr % FLASH_PAGE_SIZE);
-        uint32_t chunk     = (total - off < page_left) ? (total - off) : page_left;
-        if (flash_page_program(addr, buf + off, (uint16_t)chunk) != FL_OK)
-            return LOG_ERR_IO;
-        addr += chunk;
-        off  += chunk;
-    }
+    uint32_t t0 = perf_cycles();
+    st = program_bytes(s_write_ptr, buf, total);
     s_last_append_us = perf_us_since(t0);
+    if (st != LOG_OK) return st;
 
     s_write_ptr += total;
     s_next_id++;
+    s_have_data = 1;
     return LOG_OK;
 }
 
+/* ------------------------------------------------------------------ 讀取 */
+
 log_status_t log_read(uint32_t rec_id, uint8_t *buf, uint16_t *len)
 {
-	uint32_t     t0   = perf_cycles();
-	log_iter_t it;
+    uint32_t     t0 = perf_cycles();
+    log_iter_t   it;
     uint32_t     addr;
     rec_header_t h;
+    it_kind_t    k;
 
     iter_begin(&it);
-
-    while ((addr = iter_next(&it, &h)) != 0) {
-        if (h.rec_id == rec_id) {
-            rec_header_t tmp = h;
-            if (!record_verify(addr, &tmp)) {
-                s_last_read_us = perf_us_since(t0);
-                return LOG_ERR_CRC;
-            }
-            uint16_t n = (h.length < *len) ? h.length : *len;
-            flash_read(addr + sizeof(h), buf, n);
-            *len = n;
+    while ((k = iter_next(&it, &addr, &h)) != IT_DONE) {
+        if (k != IT_RECORD || h.rec_id != rec_id) continue;
+        if (!payload_ok(addr, &h)) {
             s_last_read_us = perf_us_since(t0);
-            return LOG_OK;
+            return LOG_ERR_CRC;
         }
+        uint16_t n = (h.length < *len) ? h.length : *len;
+        flash_read(addr + sizeof(h), buf, n);
+        *len = n;
+        s_last_read_us = perf_us_since(t0);
+        return LOG_OK;
     }
 
     s_last_read_us = perf_us_since(t0);
@@ -371,21 +458,26 @@ void log_dump(uint32_t start_id, uint32_t count)
     log_iter_t   it;
     rec_header_t h;
     uint32_t     addr;
+    it_kind_t    k;
 
     if (count == 0) count = 20;
 
     iter_begin(&it);
 
     if (start_id == 0) {
-    	uint32_t valid, corrupt;
-    	count_records(&valid, &corrupt);
-    	uint32_t total = valid + corrupt;      /* dump 要顯示全部，含損毀 */
-    	uint32_t skip  = (total > count) ? (total - count) : 0;
-        iter_begin(&it);
-        while (skip-- > 0 && iter_next(&it, &h) != 0) { }
+        uint32_t valid, corrupt;
+        count_records(&valid, &corrupt);
+        uint32_t total = valid + corrupt;      /* dump 要顯示全部，含損毀 */
+        uint32_t skip  = (total > count) ? (total - count) : 0;
+        while (skip-- > 0 && iter_next(&it, &addr, &h) != IT_DONE) { }
     }
 
-    while (count > 0 && (addr = iter_next(&it, &h)) != 0) {
+    while (count > 0 && (k = iter_next(&it, &addr, &h)) != IT_DONE) {
+        if (k == IT_BAD) {
+            log_printf("  [?] @0x%06X bad header, rest of sector skipped\r\n", (unsigned)addr);
+            count--;
+            continue;
+        }
         if (start_id != 0 && h.rec_id < start_id) continue;   /* 還沒到 */
         print_record(addr, &h);
         count--;
@@ -394,14 +486,12 @@ void log_dump(uint32_t start_id, uint32_t count)
 
 void log_stats(void)
 {
-	uint32_t valid, corrupt;
-	count_records(&valid, &corrupt);
+    uint32_t valid, corrupt;
+    count_records(&valid, &corrupt);
 
-	uint32_t sectors_used = (sector_index(s_active_addr) - sector_index(s_oldest_addr)
-	                         + LOG_SECTOR_COUNT) % LOG_SECTOR_COUNT + 1;
-	log_printf("[LOG ] records=%u corrupt=%u sectors=%u/%u wp=0x%06X next_id=%u\r\n",
-	           (unsigned)valid, (unsigned)corrupt, (unsigned)sectors_used, LOG_SECTOR_COUNT,
-	           (unsigned)s_write_ptr, (unsigned)s_next_id);
+    log_printf("[LOG ] records=%u corrupt=%u sectors=%u/%u wp=0x%06X next_id=%u\r\n",
+               (unsigned)valid, (unsigned)corrupt, (unsigned)sectors_in_use(), LOG_SECTOR_COUNT,
+               (unsigned)s_write_ptr, (unsigned)s_next_id);
     log_printf("[LOG ] last_append_us=%u last_read_us=%u init_us=%u\r\n",
                (unsigned)s_last_append_us, (unsigned)s_last_read_us,
                (unsigned)s_last_init_us);
@@ -414,55 +504,63 @@ void log_stats(void)
 /* 清空 log 區（目前只擦前 16 個 sector = 64KB，夠測試用） */
 log_status_t log_format(void)
 {
-	for (uint32_t a = LOG_AREA_START; a < LOG_AREA_END; a += FLASH_SECTOR_SIZE) {
-	    if (flash_sector_erase(a) != FL_OK) return LOG_ERR_IO;
-	}
-	s_write_ptr   = LOG_AREA_START;
+    for (uint32_t a = LOG_AREA_START; a < LOG_AREA_END; a += FLASH_SECTOR_SIZE) {
+        if (flash_sector_erase(a) != FL_OK) return LOG_ERR_IO;
+    }
+    s_write_ptr   = LOG_AREA_START;
     s_oldest_addr = LOG_AREA_START;
     s_active_addr = LOG_AREA_START;
     s_next_id     = 1;
+    s_have_data   = 0;
+    s_recovered   = 0;
     s_erase_count = 0;
     return LOG_OK;
 }
 
-/* 故意寫一筆 CRC 錯誤的 record（模擬資料損毀） */
+/* ------------------------------------------------------------------ 測試用：故障注入 */
+
+/* 準備一個 header（magic、rec_id、length、timestamp、hcrc 都正確） */
+static void make_header(rec_header_t *h, const uint8_t *data, uint16_t len)
+{
+    h->magic     = LOG_MAGIC;
+    h->rec_id    = s_next_id;
+    h->length    = len;
+    h->timestamp = HAL_GetTick();
+    h->crc32     = 0;
+    h->hcrc      = header_crc(h);
+    h->crc32     = record_crc(h, data);
+}
+
+/* 故意寫一筆 CRC 錯誤的 record（header 正確，payload 的 CRC 不對；模擬資料損毀） */
 log_status_t log_inject_corrupt(void)
 {
     const char *msg = "CORRUPTED";
     uint16_t len = 9;
 
+    if (make_room(sizeof(rec_header_t) + len) != LOG_OK) return LOG_ERR_IO;
+
     rec_header_t h;
-    h.magic     = LOG_MAGIC;
-    h.rec_id    = s_next_id;
-    h.length    = len;
-    h.reserved  = 0;
-    h.timestamp = HAL_GetTick();
-    h.crc32     = 0xDEADBEEFu;        /* 故意填錯 */
+    make_header(&h, (const uint8_t *)msg, len);
+    h.crc32 = 0xDEADBEEFu;                 /* 故意填錯 */
 
     uint8_t buf[sizeof(h) + 16];
     memcpy(buf, &h, sizeof(h));
     memcpy(buf + sizeof(h), msg, len);
 
-    if (flash_page_program(s_write_ptr, buf, sizeof(h) + len) != FL_OK)
-        return LOG_ERR_IO;
+    if (program_bytes(s_write_ptr, buf, sizeof(h) + len) != LOG_OK) return LOG_ERR_IO;
 
     log_printf("[LOG ] injected corrupt record @0x%06X\r\n", (unsigned)s_write_ptr);
-    return LOG_OK;   /* 刻意不更新 write_ptr */
+    return LOG_OK;   /* 刻意不更新 write_ptr：接著用 log remount 模擬斷電重開 */
 }
 
 /* 只寫 header + 一半 payload（模擬寫入中斷電） */
 log_status_t log_inject_partial(const uint8_t *data, uint16_t len)
 {
-    if (len < 2) return LOG_ERR_PARAM;
+    if (len < 2 || len > LOG_MAX_PAYLOAD) return LOG_ERR_PARAM;
+    if (make_room(sizeof(rec_header_t) + len) != LOG_OK) return LOG_ERR_IO;
 
     rec_header_t h;
-    h.magic     = LOG_MAGIC;
-    h.rec_id    = s_next_id;
-    h.length    = len;              /* header 說有 len bytes */
-    h.reserved  = 0;
-    h.timestamp = HAL_GetTick();
-    h.crc32     = 0;
-    h.crc32     = record_crc(&h, data);   /* CRC 是完整資料的 */
+    make_header(&h, data, len);            /* CRC 是完整資料的 */
 
     /* 但只寫 header + 一半 payload */
     uint16_t half = len / 2;
@@ -470,12 +568,72 @@ log_status_t log_inject_partial(const uint8_t *data, uint16_t len)
     memcpy(buf, &h, sizeof(h));
     memcpy(buf + sizeof(h), data, half);
 
-    if (flash_page_program(s_write_ptr, buf, sizeof(h) + half) != FL_OK)
-        return LOG_ERR_IO;
+    if (program_bytes(s_write_ptr, buf, sizeof(h) + half) != LOG_OK) return LOG_ERR_IO;
 
     log_printf("[LOG ] injected partial record @0x%06X (%u of %u bytes)\r\n",
                (unsigned)s_write_ptr, half, len);
     return LOG_OK;
+}
+
+/* 只寫 header 的前 8 bytes（magic + rec_id）：模擬 header 寫到一半就斷電 */
+log_status_t log_inject_torn_header(void)
+{
+    const uint8_t dummy[4] = { 't', 'o', 'r', 'n' };
+    if (make_room(sizeof(rec_header_t) + sizeof(dummy)) != LOG_OK) return LOG_ERR_IO;
+
+    rec_header_t h;
+    make_header(&h, dummy, sizeof(dummy));
+    if (program_bytes(s_write_ptr, (const uint8_t *)&h, 8) != LOG_OK) return LOG_ERR_IO;
+
+    log_printf("[LOG ] injected torn header @0x%06X (8 of %u bytes)\r\n",
+               (unsigned)s_write_ptr, (unsigned)sizeof(h));
+    return LOG_OK;
+}
+
+/* 在 write pointer 寫一筆 PAD 就停：模擬換 sector 時，PAD 寫完、下一個 sector 還沒寫就斷電 */
+log_status_t log_inject_pad_cut(void)
+{
+    uint32_t left = sector_end_of(s_active_addr) - s_write_ptr;
+    if (left < sizeof(rec_header_t)) {
+        log_printf("[LOG ] no room for PAD in this sector\r\n");
+        return LOG_ERR_FULL;
+    }
+    if (write_pad(s_write_ptr, sector_end_of(s_active_addr)) != LOG_OK) return LOG_ERR_IO;
+
+    log_printf("[LOG ] injected PAD @0x%06X (power cut before next sector)\r\n",
+               (unsigned)s_write_ptr);
+    return LOG_OK;
+}
+
+/* 連續寫 count 筆、每筆 len bytes：用來測剛好寫滿、繞一圈 */
+log_status_t log_fill(uint32_t count, uint16_t len)
+{
+    if (len == 0 || len > LOG_MAX_PAYLOAD) return LOG_ERR_PARAM;
+
+    uint8_t buf[LOG_MAX_PAYLOAD];
+    uint32_t done = 0;
+    log_status_t st = LOG_OK;
+
+    while (done < count) {
+        char tag[16];
+        int n = snprintf(tag, sizeof(tag), "fill%05u", (unsigned)(s_next_id % 100000u));
+        memset(buf, '.', len);
+        memcpy(buf, tag, (n < (int)len) ? (uint32_t)n : len);
+        st = log_append(buf, len);
+        if (st != LOG_OK) break;
+        done++;
+    }
+
+    log_printf("[LOG ] fill: %u of %u records (%u B each), wp=0x%06X next_id=%u active=S%u\r\n",
+               (unsigned)done, (unsigned)count, (unsigned)len, (unsigned)s_write_ptr,
+               (unsigned)s_next_id, (unsigned)sector_index(s_active_addr));
+    return st;
+}
+
+/* 測試用：目前看得到的有效、損毀筆數 */
+void log_get_counts(uint32_t *valid, uint32_t *corrupt)
+{
+    count_records(valid, corrupt);
 }
 
 uint32_t log_last_append_us(void) { return s_last_append_us; }

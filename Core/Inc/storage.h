@@ -26,6 +26,9 @@ typedef enum {
 	REQ_LOG_REMOUNT,
 	REQ_LOG_WEAR,
 	REQ_WEAR_RESET,
+	REQ_LOG_TORNHDR,
+	REQ_LOG_PADCUT,
+	REQ_LOG_FILL,
 } req_type_t;
 
 typedef struct {
