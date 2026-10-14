@@ -7,13 +7,18 @@
 
 /* log.c — append-only log over SPI NOR flash
  *
- * 斷電恢復的三條規則（2026/10 改版）：
+ * 斷電恢復的規則（2026/10 改版）：
  *   1. header 自己有 CRC-16（放在原本的 reserved）。驗得過，rec_id 和 length 才拿來用。
  *   2. 掃描遇到不可信的 header，只放棄那個 sector 剩下的部分，從下一個 sector 開頭繼續。
  *      record 不跨 sector，所以 sector 開頭一定是 record 的起點。
  *      尾端只在最新的 sector 裡找，壞掉的資料不再被當成尾端。
- *   3. 跨進新 sector 只有一個入口 enter_sector()：不是全 FF 就先擦，再寫。
- *      換 sector、剛好寫滿、開機恢復，全部走這裡。
+ *   3. 跨進新 sector 只有一個入口 enter_sector()：一律先擦，再寫。
+ *      讀起來全是 FF 不代表擦完（擦到一半斷電也可能讀成 FF），所以不靠讀來判斷。
+ *      log 是空的時候，第一筆寫入前也先擦 S0。
+ *      所以：寫進一個 sector 之前，一定是自己擦完的；開機後接著寫的 sector，
+ *      裡面第一筆可信的 header 就證明當初擦完了。
+ *   4. 執行中寫入或擦除失敗，跟斷電一樣處理：停止寫入，不在執行中猜 flash 上寫了多少；
+ *      remount 或重開時，由 log_init 從 flash 重新判斷位置和編號。
  */
 
 #include "log.h"
@@ -30,6 +35,8 @@ static uint32_t s_oldest_addr;   /* 最舊 sector 的起始位址（繞一圈時
 static uint32_t s_active_addr;   /* 目前寫入中的 sector 起始位址 */
 static int      s_have_data;     /* log 裡有沒有任何 record */
 static int      s_recovered;     /* 這次開機有沒有放棄寫壞的尾端 */
+static int      s_need_erase;    /* 目前的 sector 這次還沒擦過，寫入前要先進 enter_sector（log 是空的時候） */
+static int      s_write_failed;  /* 寫入或擦除失敗過：flash 上的狀態不確定，log_init 之前不再寫 */
 static uint32_t s_erase_count;   /* 本次開機以來的擦除次數（暫存在 RAM） */
 
 static uint32_t s_last_append_us;
@@ -261,36 +268,59 @@ static log_status_t write_pad(uint32_t addr, uint32_t sec_end)
     return program_bytes(addr, (const uint8_t *)&h, sizeof(h));
 }
 
-/* 跨進一個新 sector 的唯一入口（format 除外）：
-   不是全 FF 就先擦；擦的是最舊的 sector，代表繞了一圈，最舊往前推一格。 */
+/* 跨進一個新 sector 的唯一入口（format 除外）：一律先擦。
+   讀起來全是 FF 也擦：擦到一半斷電的 sector 可能讀起來全是 FF，但沒擦完，寫進去的資料之後可能讀錯。
+   擦的是最舊的 sector，代表繞了一圈，最舊往前推一格。 */
 static log_status_t enter_sector(uint32_t sec)
 {
     int wraps = s_have_data && (sec == s_oldest_addr);
     if (wraps && s_mode == LOG_MODE_STOP) return LOG_ERR_FULL;
 
-    if (!range_is_blank(sec, sec + FLASH_SECTOR_SIZE)) {
-        uint32_t te = perf_cycles();
-        if (flash_sector_erase(sec) != FL_OK) return LOG_ERR_IO;
-        wear_record_erase(sector_index(sec));
-        s_last_erase_us = perf_us_since(te);
-        s_erase_count++;
-    }
+    uint32_t te = perf_cycles();
+    if (flash_sector_erase(sec) != FL_OK) return LOG_ERR_IO;
+    wear_record_erase(sector_index(sec));
+    s_last_erase_us = perf_us_since(te);
+    s_erase_count++;
 
     if (wraps)        s_oldest_addr = next_sector_addr(s_oldest_addr);   /* 那些 record 沒了 */
     if (!s_have_data) s_oldest_addr = sec;
     s_active_addr = sec;
     s_write_ptr   = sec;
+    s_need_erase  = 0;
     return LOG_OK;
 }
 
 /* 確保目前的 sector 放得下 total bytes；放不下（含剛好寫滿、開機時判定已滿）就換 sector */
 static log_status_t make_room(uint32_t total)
 {
+    if (s_need_erase) return enter_sector(s_active_addr);   /* log 是空的：S0 先擦再寫 */
+
     uint32_t sec_end = sector_end_of(s_active_addr);
     if (s_write_ptr + total <= sec_end) return LOG_OK;
 
     if (write_pad(s_write_ptr, sec_end) != LOG_OK) return LOG_ERR_IO;
+    s_write_ptr = sec_end;   /* PAD 寫好，這個 sector 就關了：換 sector 沒成功的話，下一筆也不能再寫進來 */
     return enter_sector(next_sector_addr(s_active_addr));
+}
+
+/* 寫入或擦除到一半失敗：flash 上實際寫了多少不知道，RAM 裡的 write pointer 也不可信了。
+   跟斷電一樣處理：不在這裡猜，停止寫入；remount 或重開時由 log_init 從 flash 重新判斷。
+   （只把 write pointer 移到 sector 結尾不夠：header 可能已經完整寫進去，再用同一個編號會重號。） */
+static log_status_t stop_writing(void)
+{
+    if (!s_write_failed)
+        log_printf("[LOG ] flash write/erase failed near 0x%06X, writes stopped until remount\r\n",
+                   (unsigned)s_write_ptr);
+    s_write_failed = 1;
+    return LOG_ERR_IO;
+}
+
+/* 寫入前的共同檢查：失敗過就不寫；空間不夠就換 sector（換的時候失敗也一樣停） */
+static log_status_t room_for(uint32_t total)
+{
+    if (s_write_failed) return LOG_ERR_IO;
+    log_status_t st = make_room(total);
+    return (st == LOG_ERR_IO) ? stop_writing() : st;
 }
 
 /* ------------------------------------------------------------------ 開機 */
@@ -328,9 +358,11 @@ log_status_t log_init(void)
     rec_header_t h;
     uint32_t     valid, corrupt;
 
-    s_next_id   = 1;
-    s_recovered = 0;
-    s_have_data = 0;
+    s_next_id      = 1;
+    s_recovered    = 0;
+    s_have_data    = 0;
+    s_need_erase   = 0;
+    s_write_failed = 0;   /* 下面會從 flash 重新判斷，之前寫失敗的地方會被當成壞尾端處理 */
 
     /* 1. 排新舊：只看 header 驗得過的 sector 開頭 */
     uint32_t min_id = 0, max_id = 0;
@@ -344,13 +376,11 @@ log_status_t log_init(void)
     }
 
     if (!s_have_data) {
-        /* 沒有任何有效 record。sector 0 不是全 FF 的話，就當它滿了：第一筆寫入時換到下一個，會先擦 */
-        s_oldest_addr = s_active_addr = LOG_AREA_START;
-        s_write_ptr   = LOG_AREA_START;
-        if (!range_is_blank(LOG_AREA_START, sector_end_of(LOG_AREA_START))) {
-            s_write_ptr = sector_end_of(LOG_AREA_START);
-            s_recovered = 1;
-        }
+        /* 沒有任何可信的 record：從 S0 開始，第一筆寫入前先擦 S0。
+           S0 可能有寫一半的 header，或擦到一半（讀起來像 FF）。不是全 FF 的話標記 recovered。 */
+        s_oldest_addr = s_active_addr = s_write_ptr = LOG_AREA_START;
+        s_need_erase  = 1;
+        s_recovered   = !range_is_blank(LOG_AREA_START, sector_end_of(LOG_AREA_START));
     } else {
         s_oldest_addr = oldest;
         s_active_addr = newest;
@@ -396,7 +426,7 @@ log_status_t log_append(const uint8_t *data, uint16_t len)
     if (data == NULL || len == 0 || len > LOG_MAX_PAYLOAD) return LOG_ERR_PARAM;
 
     uint32_t total = sizeof(rec_header_t) + len;
-    log_status_t st = make_room(total);
+    log_status_t st = room_for(total);
     if (st != LOG_OK) return st;
 
     rec_header_t h;
@@ -416,7 +446,7 @@ log_status_t log_append(const uint8_t *data, uint16_t len)
     uint32_t t0 = perf_cycles();
     st = program_bytes(s_write_ptr, buf, total);
     s_last_append_us = perf_us_since(t0);
-    if (st != LOG_OK) return st;
+    if (st != LOG_OK) return stop_writing();
 
     s_write_ptr += total;
     s_next_id++;
@@ -499,21 +529,25 @@ void log_stats(void)
                (unsigned)sector_index(s_oldest_addr),
                (unsigned)sector_index(s_active_addr),
                (unsigned)s_erase_count, (unsigned)s_last_erase_us);
+    if (s_write_failed)
+        log_printf("[LOG ] writes stopped after a flash failure: run log remount\r\n");
 }
 
 /* 清空 log 區（目前只擦前 16 個 sector = 64KB，夠測試用） */
 log_status_t log_format(void)
 {
     for (uint32_t a = LOG_AREA_START; a < LOG_AREA_END; a += FLASH_SECTOR_SIZE) {
-        if (flash_sector_erase(a) != FL_OK) return LOG_ERR_IO;
+        if (flash_sector_erase(a) != FL_OK) return stop_writing();   /* 擦到一半：RAM 裡的狀態已經不對 */
     }
-    s_write_ptr   = LOG_AREA_START;
-    s_oldest_addr = LOG_AREA_START;
-    s_active_addr = LOG_AREA_START;
-    s_next_id     = 1;
-    s_have_data   = 0;
-    s_recovered   = 0;
-    s_erase_count = 0;
+    s_write_ptr    = LOG_AREA_START;
+    s_oldest_addr  = LOG_AREA_START;
+    s_active_addr  = LOG_AREA_START;
+    s_next_id      = 1;
+    s_have_data    = 0;
+    s_recovered    = 0;
+    s_erase_count  = 0;
+    s_need_erase   = 0;   /* 剛全部擦完 */
+    s_write_failed = 0;
     return LOG_OK;
 }
 
@@ -537,7 +571,8 @@ log_status_t log_inject_corrupt(void)
     const char *msg = "CORRUPTED";
     uint16_t len = 9;
 
-    if (make_room(sizeof(rec_header_t) + len) != LOG_OK) return LOG_ERR_IO;
+    log_status_t st = room_for(sizeof(rec_header_t) + len);
+    if (st != LOG_OK) return st;
 
     rec_header_t h;
     make_header(&h, (const uint8_t *)msg, len);
@@ -547,7 +582,7 @@ log_status_t log_inject_corrupt(void)
     memcpy(buf, &h, sizeof(h));
     memcpy(buf + sizeof(h), msg, len);
 
-    if (program_bytes(s_write_ptr, buf, sizeof(h) + len) != LOG_OK) return LOG_ERR_IO;
+    if (program_bytes(s_write_ptr, buf, sizeof(h) + len) != LOG_OK) return stop_writing();
 
     log_printf("[LOG ] injected corrupt record @0x%06X\r\n", (unsigned)s_write_ptr);
     return LOG_OK;   /* 刻意不更新 write_ptr：接著用 log remount 模擬斷電重開 */
@@ -557,7 +592,8 @@ log_status_t log_inject_corrupt(void)
 log_status_t log_inject_partial(const uint8_t *data, uint16_t len)
 {
     if (len < 2 || len > LOG_MAX_PAYLOAD) return LOG_ERR_PARAM;
-    if (make_room(sizeof(rec_header_t) + len) != LOG_OK) return LOG_ERR_IO;
+    log_status_t st = room_for(sizeof(rec_header_t) + len);
+    if (st != LOG_OK) return st;
 
     rec_header_t h;
     make_header(&h, data, len);            /* CRC 是完整資料的 */
@@ -568,7 +604,7 @@ log_status_t log_inject_partial(const uint8_t *data, uint16_t len)
     memcpy(buf, &h, sizeof(h));
     memcpy(buf + sizeof(h), data, half);
 
-    if (program_bytes(s_write_ptr, buf, sizeof(h) + half) != LOG_OK) return LOG_ERR_IO;
+    if (program_bytes(s_write_ptr, buf, sizeof(h) + half) != LOG_OK) return stop_writing();
 
     log_printf("[LOG ] injected partial record @0x%06X (%u of %u bytes)\r\n",
                (unsigned)s_write_ptr, half, len);
@@ -579,11 +615,12 @@ log_status_t log_inject_partial(const uint8_t *data, uint16_t len)
 log_status_t log_inject_torn_header(void)
 {
     const uint8_t dummy[4] = { 't', 'o', 'r', 'n' };
-    if (make_room(sizeof(rec_header_t) + sizeof(dummy)) != LOG_OK) return LOG_ERR_IO;
+    log_status_t st = room_for(sizeof(rec_header_t) + sizeof(dummy));
+    if (st != LOG_OK) return st;
 
     rec_header_t h;
     make_header(&h, dummy, sizeof(dummy));
-    if (program_bytes(s_write_ptr, (const uint8_t *)&h, 8) != LOG_OK) return LOG_ERR_IO;
+    if (program_bytes(s_write_ptr, (const uint8_t *)&h, 8) != LOG_OK) return stop_writing();
 
     log_printf("[LOG ] injected torn header @0x%06X (8 of %u bytes)\r\n",
                (unsigned)s_write_ptr, (unsigned)sizeof(h));
@@ -593,12 +630,17 @@ log_status_t log_inject_torn_header(void)
 /* 在 write pointer 寫一筆 PAD 就停：模擬換 sector 時，PAD 寫完、下一個 sector 還沒寫就斷電 */
 log_status_t log_inject_pad_cut(void)
 {
+    if (s_write_failed) return LOG_ERR_IO;
+    if (s_need_erase) {                     /* log 是空的：跟一般寫入一樣，S0 先擦 */
+        log_status_t st = room_for(sizeof(rec_header_t));
+        if (st != LOG_OK) return st;
+    }
     uint32_t left = sector_end_of(s_active_addr) - s_write_ptr;
     if (left < sizeof(rec_header_t)) {
         log_printf("[LOG ] no room for PAD in this sector\r\n");
         return LOG_ERR_FULL;
     }
-    if (write_pad(s_write_ptr, sector_end_of(s_active_addr)) != LOG_OK) return LOG_ERR_IO;
+    if (write_pad(s_write_ptr, sector_end_of(s_active_addr)) != LOG_OK) return stop_writing();
 
     log_printf("[LOG ] injected PAD @0x%06X (power cut before next sector)\r\n",
                (unsigned)s_write_ptr);

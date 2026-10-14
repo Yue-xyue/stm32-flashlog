@@ -2,6 +2,7 @@
  * flash.c — W25Q / XT25F 系列 SPI NOR flash driver
  */
 #include "flash.h"
+#include <stdio.h>
 
 /* ---- 內部：命令碼 ---- */
 #define CMD_READ_STATUS   0x05
@@ -13,17 +14,32 @@
 
 #define STATUS_WIP        0x01   /* bit0: Write In Progress */
 
+#define BUSY_MAX_MS       2000   /* 最久的操作（sector erase）也該在這之內做完 */
+#define PROGRAM_MAX_MS    100
+
 #define CS_LOW()   HAL_GPIO_WritePin(FLASH_CS_GPIO_Port, FLASH_CS_Pin, GPIO_PIN_RESET)
 #define CS_HIGH()  HAL_GPIO_WritePin(FLASH_CS_GPIO_Port, FLASH_CS_Pin, GPIO_PIN_SET)
 
 static SPI_HandleTypeDef *s_hspi = NULL;   /* 初始化時傳入 */
+
+static fl_status_t wait_ready(uint32_t timeout_ms);
 
 fl_status_t flash_init(SPI_HandleTypeDef *hspi)
 {
     if (hspi == NULL) return FL_ERR_PARAM;
     s_hspi = hspi;
     CS_HIGH();                 /* 確保閒置時 CS 為高 */
-    return FL_OK;
+
+    /* reset 鍵、watchdog、重新燒錄都只重置 MCU，flash 不會跟著重置：
+       上一次的擦除或寫入可能還在跑，這段時間 flash 只回應讀狀態，讀資料會讀到錯的東西。
+       先等它做完，wear_init、log_init 才去讀。 */
+    if ((flash_read_status() & STATUS_WIP) == 0) return FL_OK;
+
+    uint32_t t0 = HAL_GetTick();
+    fl_status_t st = wait_ready(BUSY_MAX_MS);
+    printf("[FLSH] busy at boot, waited %lu ms%s\r\n",
+           (unsigned long)(HAL_GetTick() - t0), (st == FL_OK) ? "" : " (timeout)");
+    return st;
 }
 
 /* ---- 內部輔助（不對外）---- */
@@ -79,13 +95,16 @@ uint8_t flash_read_status(void)
     return rx[1];
 }
 
+/* 寫入、擦除都是「送指令前先等、送完再等」：
+   只在送完後等的話，前一個操作逾時其實還在跑時，這次的指令會被 flash 忽略，卻回報成功 */
 fl_status_t flash_sector_erase(uint32_t addr)
 {
+    if (wait_ready(BUSY_MAX_MS) != FL_OK) return FL_ERR_TIMEOUT;
     write_enable();
     CS_LOW();
     send_cmd_addr(CMD_SECTOR_ERASE, addr);
     CS_HIGH();
-    return wait_ready(2000);          /* erase 慢，逾時給足 */
+    return wait_ready(BUSY_MAX_MS);   /* erase 慢，逾時給足 */
 }
 
 fl_status_t flash_page_program(uint32_t addr, const uint8_t *data, uint16_t len)
@@ -93,13 +112,14 @@ fl_status_t flash_page_program(uint32_t addr, const uint8_t *data, uint16_t len)
     if (data == NULL || len == 0 || len > FLASH_PAGE_SIZE) return FL_ERR_PARAM;
     /* 不可跨頁：超出的部分會繞回本頁開頭覆蓋 */
     if (((addr % FLASH_PAGE_SIZE) + len) > FLASH_PAGE_SIZE) return FL_ERR_PARAM;
+    if (wait_ready(BUSY_MAX_MS) != FL_OK) return FL_ERR_TIMEOUT;
 
     write_enable();
     CS_LOW();
     send_cmd_addr(CMD_PAGE_PROGRAM, addr);
     HAL_SPI_Transmit(s_hspi, (uint8_t *)data, len, HAL_MAX_DELAY);
     CS_HIGH();
-    return wait_ready(100);
+    return wait_ready(PROGRAM_MAX_MS);
 }
 
 void flash_read(uint32_t addr, uint8_t *buf, uint32_t len)

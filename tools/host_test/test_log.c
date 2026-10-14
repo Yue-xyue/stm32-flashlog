@@ -2,7 +2,8 @@
  *
  *   demo       ：照板子上的指令跑一次「寫到一半 → 重開 → 寫一筆 → 再重開」，印出 log 的輸出
  *   scenarios  ：保證範圍表上的每一種情況各跑一次
- *   torture N  ：N 組隨機測試；每組連續寫入、在隨機一次 flash 操作中途斷電、重開機後檢查，重複 30 輪
+ *   torture N  ：N 組隨機測試；每組連續寫入，在隨機一次 flash 操作中途斷電（或讓 flash 回傳失敗），
+ *                重開機後檢查，重複 30 輪
  *
  * 檢查不靠 log.c 自己的判斷：直接在 flash 映像裡逐 byte 找「magic 對、CRC32 也對」的 record，
  * 這就是 flash 上真的還留著的資料，再跟「log_append 回傳成功的資料」比對。
@@ -10,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include "log.h"
 #include "wear.h"
 #include "crc32.h"
@@ -27,6 +29,7 @@ typedef struct {
 static mrec_t   model[MAXREC + 1];
 static uint32_t g_seq;
 static int      g_cycle;
+static long     g_remounts;
 
 /* flash 上實際找到的 record */
 typedef struct { uint32_t addr, id, seq; uint16_t len; } found_t;
@@ -59,21 +62,33 @@ static log_status_t do_append(uint16_t len)
 
 static void reboot(void)
 {
-    sim_cut_countdown = 0;
+    sim_cut_countdown  = 0;
+    sim_fail_countdown = 0;
+    sim_fail_happened  = 0;
     wear_init();
     log_init();
 }
 
-/* 連續寫 n 筆；中途斷電就回傳 1（等於板子斷電），寫入失敗回傳 -1 */
+static uint16_t pick_len(int mode)
+{
+    if (mode == 1) return 44;                                /* 64 B 一筆：剛好填滿 sector */
+    if (mode == 2) return 64;
+    return (uint16_t)(4 + sim_rand() % 61u);                 /* 4..64 */
+}
+
+/* 連續寫 n 筆；中途斷電就回傳 1（等於板子斷電），寫入失敗回傳 -1。
+   flash 被設定成回傳失敗時（sim_fail_happened），就像一般程式一樣：不理會錯誤再寫 3 筆，
+   然後 remount（log_init）繼續寫。新版在 remount 前會拒絕寫入，舊版會照寫。 */
 static int append_many(int n, int mode)
 {
     if (setjmp(sim_cut_jmp)) return 1;
     for (volatile int i = 0; i < n; i++) {
-        uint16_t len;
-        if (mode == 1)      len = 44;                                /* 64 B 一筆：剛好填滿 sector */
-        else if (mode == 2) len = 64;
-        else                len = (uint16_t)(4 + sim_rand() % 61u);  /* 4..64 */
-        if (do_append(len) != LOG_OK) return -1;
+        if (do_append(pick_len(mode)) == LOG_OK) continue;
+        if (!sim_fail_happened) return -1;
+        sim_fail_happened = 0;
+        for (int k = 0; k < 3; k++) do_append(pick_len(mode));
+        log_init();
+        g_remounts++;
     }
     return 0;
 }
@@ -105,16 +120,20 @@ static void scan_flash(void)
     }
 }
 
-static int fail(const char *msg, unsigned a, unsigned b)
+static int fail(const char *fmt, ...)
 {
-    snprintf(g_fail, sizeof(g_fail), msg, a, b);
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_fail, sizeof(g_fail), fmt, ap);
+    va_end(ap);
     return 0;
 }
 
 /* window：這一輪和前 window-1 輪寫入成功的，都必須還在 */
 static int verify(int window, uint32_t skip_seq)
 {
-    if (sim_outside_writes) return fail("寫到 log 區外面 %u 次%u", (unsigned)sim_outside_writes, 0);
+    if (sim_outside_writes) return fail("寫到 log 區外面 %u 次", (unsigned)sim_outside_writes);
+    if (sim_weak_writes) return fail("寫進了沒擦完（讀起來可能全是 FF）的 sector %u 次", (unsigned)sim_weak_writes);
 
     scan_flash();
 
@@ -191,7 +210,7 @@ static int sc_torn_once(void)
     append_many(2, 0);
     sim_cut_kind = CUT_PROGRAM; sim_torn_mode = TORN_HALF; sim_cut_countdown = 1;
     g_cycle++; append_many(1, 0); reboot();
-    g_cycle++; if (append_many(3, 0)) return fail("重開後寫入失敗%u%u", 0, 0);
+    g_cycle++; if (append_many(3, 0)) return fail("重開後寫入失敗");
     reboot();
     return verify(3, 0);
 }
@@ -220,7 +239,7 @@ static int sc_middle_corrupt(void)
     /* 除了第 20 筆，前面 100 筆和後來的 5 筆都必須還在 */
     if (!verify(1, 0)) return 0;
     for (uint32_t s = 1; s <= g_seq; s++)
-        if (s != 20 && seq_found[s] < 0) return fail("壞掉的那筆之後的資料不見了：seq=%u%u", s, 0);
+        if (s != 20 && seq_found[s] < 0) return fail("壞掉的那筆之後的資料不見了：seq=%u", s);
     return 1;
 }
 
@@ -265,7 +284,7 @@ static int sc_middle_header(void)
     g_cycle++; append_many(5, 0); reboot();
     if (!verify(1, 0)) return 0;
     for (uint32_t s = 1; s <= g_seq; s++)
-        if ((s < 20 || s > lost_until) && seq_found[s] < 0) return fail("不該遺失的資料不見了：seq=%u%u", s, 0);
+        if ((s < 20 || s > lost_until) && seq_found[s] < 0) return fail("不該遺失的資料不見了：seq=%u", s);
     return 1;
 }
 
@@ -283,7 +302,7 @@ static int sc_half_erase(void)
         g_cycle++; append_many(10, 0); reboot();
         if (!verify(2, 0)) fails++;
     }
-    if (fails) return fail("100 次裡有 %u 次出錯%u", (unsigned)fails, 0);
+    if (fails) return fail("100 次裡有 %u 次出錯", (unsigned)fails);
     return 1;
 }
 
@@ -291,16 +310,77 @@ static int sc_half_erase(void)
 static int sc_exact_fill(void)
 {
     fresh(7);
-    if (append_many(16 * 64 + 40, 1)) return fail("寫入失敗%u%u", 0, 0);
+    if (append_many(16 * 64 + 40, 1)) return fail("寫入失敗");
     reboot();
     g_cycle = 5;
-    if (append_many(5, 1)) return fail("寫入失敗%u%u", 0, 0);
+    if (append_many(5, 1)) return fail("寫入失敗");
     reboot();
     if (!verify(1, 0)) return 0;
     /* 繞一圈只會回收最舊的 sector：最近 14 個 sector 的資料（896 筆）都必須還在 */
     for (uint32_t s = g_seq - 5 - 896 + 1; s <= g_seq; s++)
-        if (seq_found[s] < 0) return fail("寫入成功的資料不見了：seq=%u%u", s, 0);
+        if (seq_found[s] < 0) return fail("寫入成功的資料不見了：seq=%u", s);
     return 1;
+}
+
+/* 8. 擦到一半斷電，而且讀起來全是 FF（繞一圈後回收最舊的 sector 時） */
+static int sc_weak_erase(void)
+{
+    int  fails = 0;
+    char first[256] = "";
+    for (uint32_t seed = 900; seed < 910; seed++) {
+        fresh(seed);
+        for (int i = 0; i < 16 * 48; i++) do_append(64);   /* 16 個 sector 剛好寫滿，下一次換 sector 要擦 S0 */
+        sim_weak_mode = WEAK_ALWAYS; sim_cut_kind = CUT_ERASE; sim_cut_countdown = 1;
+        g_cycle++; append_many(5, 2); reboot();
+        g_cycle++;
+        int ok = (append_many(60, 0) == 0) ? (reboot(), verify(2, 0)) : fail("重開後寫入失敗");
+        if (!ok) { fails++; if (!first[0]) snprintf(first, sizeof(first), "%s", g_fail); }
+    }
+    if (fails) { snprintf(g_fail, sizeof(g_fail), "10 次裡有 %d 次出錯，第一個：%s", fails, first); return 0; }
+    return 1;
+}
+
+/* 9. format 擦 S0 時斷電，讀起來全是 FF：log 是空的，第一筆寫進 S0 之前要先擦 */
+static int sc_weak_format(void)
+{
+    fresh(9);
+    for (int i = 0; i < 30; i++) do_append(40);
+    sim_weak_mode = WEAK_ALWAYS; sim_cut_kind = CUT_ERASE; sim_cut_countdown = 1;
+    g_cycle++;
+    if (!setjmp(sim_cut_jmp)) log_format();
+    reboot();
+    g_cycle++; if (append_many(10, 0)) return fail("重開後寫入失敗");
+    reboot();
+    return verify(1, 0);
+}
+
+/* 10. 寫入時 flash 回傳失敗（沒斷電），程式不理會錯誤繼續寫，之後 remount */
+static int sc_program_fail(void)
+{
+    fresh(10);
+    append_many(100, 0);
+    sim_fail_kind = CUT_PROGRAM; sim_fail_countdown = 1;
+    g_cycle++; if (append_many(10, 0)) return fail("寫入失敗");
+    reboot();
+    g_cycle++; if (append_many(5, 0)) return fail("重開後寫入失敗");
+    reboot();
+    return verify(3, 0);
+}
+
+/* 11. 換 sector 時 PAD 寫好了，擦下一個 sector 回傳失敗（沒斷電），接著寫比較短的 */
+static int sc_erase_fail(void)
+{
+    fresh(11);
+    for (int i = 0; i < 16 * 48; i++) do_append(64);    /* 16 個 sector 寫滿，每個剩 64 B */
+    sim_fail_kind = CUT_ERASE; sim_fail_countdown = 1;
+    g_cycle++;
+    do_append(64);                                     /* 放不下 → 寫 PAD → 擦 S0 回傳失敗 */
+    do_append(10);                                     /* 30 B 放得進剩下的 64 B：舊版會寫在 PAD 上 */
+    do_append(10);
+    log_init();                                        /* remount */
+    if (append_many(20, 0)) return fail("remount 後寫入失敗");
+    reboot();
+    return verify(1, 0);
 }
 
 static void run_scenarios(void)
@@ -314,6 +394,10 @@ static void run_scenarios(void)
         { "中間某筆的 header 壞掉",         sc_middle_header },
         { "擦到一半斷電（100 種擦法）",     sc_half_erase },
         { "剛好填滿 sector（不是斷電）",    sc_exact_fill },
+        { "擦到一半斷電，讀起來全是 FF",    sc_weak_erase },
+        { "format 擦到一半，讀起來全是 FF", sc_weak_format },
+        { "寫入回傳失敗，之後繼續寫",       sc_program_fail },
+        { "PAD 寫好、擦除回傳失敗",         sc_erase_fail },
     };
     int n = (int)(sizeof(sc) / sizeof(sc[0])), pass = 0;
     for (int i = 0; i < n; i++) {
@@ -329,29 +413,35 @@ static void run_scenarios(void)
 
 static void run_torture(int seeds)
 {
-    long cuts = 0, reboots = 0, fails = 0, erase_cuts = 0;
+    long cuts = 0, erase_cuts = 0, weak_cuts = 0, flash_fails = 0, reboots = 0, fails = 0;
     char first_fail[300] = "";
 
+    g_remounts = 0;
     for (int seed = 1; seed <= seeds; seed++) {
         fresh(1000u + (uint32_t)seed);
         int mode = (int)(sim_rand() % 4u);        /* 0、3：隨機長度；1：64 B 一筆（剛好填滿）；2：84 B 一筆 */
         if (mode == 3) mode = 0;
+        sim_weak_mode = WEAK_RANDOM;              /* 斷在擦除中途時，一半讀起來全是 FF */
         int ok = 1;
         for (g_cycle = 1; g_cycle <= 30 && ok; g_cycle++) {
             int n = 1 + (int)(sim_rand() % 80u);
-            int r = (int)(sim_rand() % 10u);
-            if (r < 6) {                                   /* 寫入或擦除中途斷電 */
+            int r = (int)(sim_rand() % 20u);
+            if (r < 11) {                                  /* 寫入或擦除中途斷電 */
                 sim_cut_kind = CUT_ANY; sim_torn_mode = TORN_RANDOM;
                 sim_cut_countdown = 1 + (long)(sim_rand() % (uint32_t)(n * 2 + 2));
-            } else if (r < 8) {                            /* 專挑擦除的時候斷電 */
+            } else if (r < 15) {                           /* 專挑擦除的時候斷電 */
                 sim_cut_kind = CUT_ERASE; sim_cut_countdown = 1;
-            } else {
-                sim_cut_countdown = 0;                     /* 正常重開機 */
-            }
+            } else if (r < 18) {                           /* 不斷電，但某次寫入或擦除回傳失敗 */
+                sim_fail_kind = CUT_ANY;
+                sim_fail_countdown = 1 + (long)(sim_rand() % (uint32_t)(n * 2 + 2));
+            }                                              /* 其他：正常重開機 */
             sim_cut_happened = 0;
+            long fails_before = sim_fails, weak_before = sim_weak_cuts;
             int rc = append_many(n, mode);
-            if (rc < 0) { ok = fail("重開後寫入失敗（第 %u 輪）%u", (unsigned)g_cycle, 0); break; }
-            if (sim_cut_happened) { cuts++; if (sim_cut_kind == CUT_ERASE) erase_cuts++; }
+            if (rc < 0) { ok = fail("重開後寫入失敗（第 %u 輪）", (unsigned)g_cycle); break; }
+            if (sim_cut_happened) { cuts++; if (sim_cut_happened == 2) erase_cuts++; }
+            weak_cuts   += sim_weak_cuts - weak_before;
+            flash_fails += sim_fails - fails_before;
             reboot();
             reboots++;
             ok = verify(3, 0);
@@ -361,8 +451,9 @@ static void run_torture(int seeds)
             if (!first_fail[0]) snprintf(first_fail, sizeof(first_fail), "seed %d：%s", seed, g_fail);
         }
     }
-    printf("  隨機斷電：%d 組 × 30 輪，斷電 %ld 次（其中擦除中途 %ld 次），重開機 %ld 次\n",
-           seeds, cuts, erase_cuts, reboots);
+    printf("  隨機測試：%d 組 × 30 輪，重開機 %ld 次\n", seeds, reboots);
+    printf("    斷電 %ld 次（其中擦除中途 %ld 次，%ld 次讀起來全是 FF）\n", cuts, erase_cuts, weak_cuts);
+    printf("    flash 回傳失敗 %ld 次（之後 remount %ld 次）\n", flash_fails, g_remounts);
     printf("  出錯的組數：%ld / %d%s%s\n", fails, seeds, fails ? "，第一個：" : "", first_fail);
 }
 
@@ -445,6 +536,14 @@ static void run_hw(void)
     cmd("log tornhdr");            log_inject_torn_header();
     cmd("(reset)");                wear_init(); log_init();
     cmd("log write after");        log_append((const uint8_t *)"after", 5);
+    cmd("(reset)");                wear_init(); log_init();
+    cmd("log dump");               log_dump(0, 20);
+
+    printf("\n---- F. log 是空的時候，header 寫到一半\n");
+    cmd("log format");             log_format();
+    cmd("log tornhdr");            log_inject_torn_header();
+    cmd("(reset)");                wear_init(); log_init();
+    cmd("log write first");        log_append((const uint8_t *)"first", 5);
     cmd("(reset)");                wear_init(); log_init();
     cmd("log dump");               log_dump(0, 20);
     sim_verbose = 0;
